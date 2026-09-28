@@ -21,13 +21,18 @@ def num(v):
         return None
 
 def load_rows():
-    if SRC:
-        text = open(SRC, encoding="utf-8").read()
-    else:
-        print("Downloading", URL, flush=True)
-        r = requests.get(URL, timeout=300); r.raise_for_status()
-        text = r.text
-    rd = csv.DictReader(io.StringIO(text))
+    """CSVを1行ずつ流し読みする（全体をメモリに載せない）。"""
+    def lines():
+        if SRC:
+            with open(SRC, encoding="utf-8") as f:
+                yield from (ln.rstrip("\n") for ln in f)
+        else:
+            print("Downloading", URL, flush=True)
+            with requests.get(URL, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                r.encoding = "utf-8"
+                yield from r.iter_lines(decode_unicode=True)
+    rd = csv.DictReader(lines())
     next(rd)  # 2行目は単位行なので読み飛ばす
     return rd
 
@@ -42,33 +47,42 @@ def build():
     CREATE INDEX idx_points_sid ON points(sid);
     CREATE INDEX idx_ty_year ON typhoons(year);
     """)
-    pts, meta = {}, {}
-    for r in load_rows():
-        lat, lon = num(r["LAT"]), num(r["LON"])
-        if lat is None or lon is None:
-            continue
-        wind = num(r["WMO_WIND"]) or num(r["USA_WIND"])
-        pres = num(r["WMO_PRES"]) or num(r["USA_PRES"])
-        sid = r["SID"]
-        name = r["NAME"].strip()
-        meta.setdefault(sid, dict(year=int(r["SEASON"]), number=int(r["NUMBER"] or 0),
-                                  name="" if name == "NOT_NAMED" else name))
-        pts.setdefault(sid, []).append((sid, r["ISO_TIME"], lat, lon, wind, pres))
-    n = 0
-    for sid, p in pts.items():
+    count = 0
+
+    def flush(m, p):
+        """1つの台風ぶんをDBへ書き込む。"""
+        nonlocal count
         winds = [x[4] for x in p if x[4]]
         press = [x[5] for x in p if x[5]]
         mw = max(winds) if winds else None
         if mw is None or mw < 34:  # 熱帯低気圧のまま終わったものは除外
-            continue
-        m = meta[sid]
-        con.execute("INSERT INTO typhoons VALUES(?,?,?,?,?,?,?,?)",
-                    (sid, m["year"], m["number"], m["name"], p[0][1], p[-1][1], mw,
+            return
+        con.execute("INSERT OR REPLACE INTO typhoons VALUES(?,?,?,?,?,?,?,?)",
+                    (m["sid"], m["year"], m["number"], m["name"], p[0][1], p[-1][1], mw,
                      min(press) if press else None))
         con.executemany("INSERT INTO points VALUES(?,?,?,?,?,?)", p)
-        n += 1
+        count += 1
+
+    cur, pts = None, []  # IBTrACSはSIDごとに連続して並んでいる
+    for r in load_rows():
+        lat, lon = num(r["LAT"]), num(r["LON"])
+        if lat is None or lon is None:
+            continue
+        sid = r["SID"]
+        if sid != cur:
+            if cur is not None:
+                flush(meta, pts)
+            name = r["NAME"].strip()
+            meta = dict(sid=sid, year=int(r["SEASON"]), number=int(r["NUMBER"] or 0),
+                        name="" if name == "NOT_NAMED" else name)
+            cur, pts = sid, []
+        wind = num(r["WMO_WIND"]) or num(r["USA_WIND"])
+        pres = num(r["WMO_PRES"]) or num(r["USA_PRES"])
+        pts.append((sid, r["ISO_TIME"], lat, lon, wind, pres))
+    if cur is not None:
+        flush(meta, pts)
     con.commit(); con.close()
-    print(f"Done: {n} typhoons")
+    print(f"Done: {count} typhoons")
 
 # ---------------- API ----------------
 app = FastAPI(title="Typhoon DB")
