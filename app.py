@@ -144,7 +144,7 @@ h1{margin:0 0 12px;font-size:22px;font-weight:900;letter-spacing:.04em}
 #list li:hover,#list li.on{background:var(--panel)}
 .sw{width:10px;height:34px;border-radius:2px;flex:none}
 .t b{display:block}.t span{color:var(--sub);font-size:12px}
-main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
+main{position:relative;min-height:0}.leaflet-tile-pane{filter:invert(1) hue-rotate(180deg) brightness(.85) contrast(.9) saturate(.6)}#map{height:100%;background:#0b1522}
 #info{position:absolute;z-index:500;right:14px;top:14px;background:rgba(15,27,43,.92);border:1px solid var(--line);padding:12px 14px;border-radius:6px;font-size:13px;min-width:200px}
 #info h2{margin:0 0 4px;font-size:18px}
 #legend{position:absolute;z-index:500;left:14px;bottom:24px;background:rgba(15,27,43,.92);border:1px solid var(--line);padding:8px 12px;border-radius:6px;font-size:12px}
@@ -170,7 +170,7 @@ const col=w=>(CLS.find(c=>(w||0)>=c[0])||CLS[5])[2];
 const cls=w=>(CLS.find(c=>(w||0)>=c[0])||CLS[5])[1];
 const $=s=>document.querySelector(s), f=$("#f");
 const map=L.map("map",{worldCopyJump:true}).setView([25,135],4);
-L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap © CARTO | IBTrACS (NOAA)",maxZoom:8}).addTo(map);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:"© OpenStreetMap contributors | IBTrACS (NOAA)",maxZoom:8}).addTo(map);
 let layer=L.layerGroup().addTo(map);
 $("#legend").innerHTML=CLS.slice(0,5).map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
 
