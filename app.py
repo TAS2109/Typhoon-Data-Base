@@ -4,7 +4,8 @@
 表記: 「2026年台風第26号 Surigae」。号数は気象庁方式（熱帯低気圧の段階は数えず、
       台風の強さに初めて達した順に年ごとに採番）で再計算する。
 風速はm/s表示（DB内部はkt保持、API出力時に換算）。
-今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）で随時更新する。
+今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）＋デジタル台風（NII、PDF未掲載の消滅済み台風の補完）で随時更新する。
+データ出典: 気象庁 / IBTrACS / デジタル台風（国立情報学研究所・北本朗）
 """
 import asyncio, csv, io, os, re, sqlite3, sys
 from contextlib import asynccontextmanager
@@ -23,6 +24,7 @@ F = "%Y-%m-%d %H:%M:%S"
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "typhoon.db")
 BOSAI = "https://www.jma.go.jp/bosai/typhoon/data"  # 発生中の台風（防災情報JSON）
 UA = {"User-Agent": "typhoon-db/1.0"}
+DT = "https://agora.ex.nii.ac.jp/digital-typhoon"  # デジタル台風（気象庁の速報値を号数つきで公開。PDF掲載前の補完用）
 INTERVAL = int(os.environ.get("REFRESH_MINUTES", "60")) * 60  # 速報の再取得間隔（秒）
 KT2MS, MS2KT = 0.514444, 1.94384
 
@@ -180,6 +182,8 @@ def fetch_pdf(c, since=None):
         h = dict(UA, **({"If-Modified-Since": since} if since else {}))
         r = requests.get(f"{JMA}/data/T{c}.pdf", headers=h, timeout=60)
         if r.status_code != 200 or not r.content.startswith(b"%PDF"):
+            if r.status_code not in (200, 304, 404):
+                print(f"T{c}.pdf: HTTP {r.status_code}", flush=True)
             return c, None, None
         with pdfplumber.open(io.BytesIO(r.content)) as pdf:
             text = "\n".join(pg.extract_text() or "" for pg in pdf.pages)
@@ -198,7 +202,7 @@ def refresh_pdf(con, yr):
     html = requests.get(f"{JMA}/position_table/table{yr}.html", headers=UA, timeout=60).text
     codes = sorted({c for c in re.findall(r"T(\d{4})\.pdf", html) if c[:2] == yy})
     top = int(codes[-1][2:]) if codes else 0
-    codes += [f"{yy}{n:02d}" for n in range(top + 1, top + 4)]
+    codes += [f"{yy}{n:02d}" for n in range(top + 1, top + 6)]  # 一覧の掲載は遅れるので先の号も探す(404は無視)
     done = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%' AND prov=0")}
     have = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%'")}
     lm = dict(con.execute("SELECT k, v FROM meta WHERE k LIKE 'lm:%'"))
@@ -211,57 +215,170 @@ def refresh_pdf(con, yr):
         insert(con, f"JMA{c}", y, no, en, pts, int(prov))
         if mod:
             con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"lm:{c}", mod))
+        con.execute("DELETE FROM meta WHERE k=?", (f"dt:JMA{c}",))  # 位置表PDFが載ったのでDT補完は不要
     print(f"JMA {yr}: PDF {len(got)}/{len(todo)} updated", flush=True)
 
-def live_point(spec):
-    """specifications.json → (英語名, (時刻UTC, 緯度, 経度, 風速kt, 気圧))。実況が無ければ None。"""
-    title = next((r for r in spec if r.get("part") == "title"), {})
-    en = ((title.get("name") or {}).get("en") or "").strip().upper()
-    for r in spec:
-        p = r.get("part")
-        if isinstance(p, dict) and p.get("jp") == "実況":
-            lat, lon = r["position"]["deg"][:2]
-            w = num(((r.get("maximumWind") or {}).get("sustained") or {}).get("m/s"))
-            t = datetime.strptime(r["validtime"]["UTC"][:19], "%Y-%m-%dT%H:%M:%S")
-            return en, (t.strftime(F), float(lat), float(lon),
-                        round(w * MS2KT) if w else None, num(r.get("pressure")) or None)
-    return None
+TRACK_STEP_H = float(os.environ.get("TRACK_STEP_H", "3"))  # forecast.json の過去軌跡の点間隔（時間）。時刻は推定値
 
-def merge_live(con, sid, year, no, en, pt):
-    """発生中の台風の最新の実況1点を追記する。位置表PDF由来の点があればそれに続け、
-    無ければ同名のIBTrACS由来の点を引き継ぐ。戻り値: 追記したか。"""
+def get_json(url, default=None):
+    try:
+        r = requests.get(url, headers=UA, timeout=30)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"GET {url} failed:", repr(e), flush=True)
+        return default
+
+def _title_en(arr):
+    t = next((r for r in arr if isinstance(r, dict) and r.get("part") == "title"), {})
+    return ((t.get("name") or {}).get("en") or "").strip().upper()
+
+def past_track(track):
+    """forecast.json の実況 track（preTyphoon＋typhoon）→ [(lat, lon)]（古い順・連続重複除去）"""
+    out = []
+    if isinstance(track, dict):
+        for k in ("preTyphoon", "typhoon"):
+            for p in track.get(k) or []:
+                try:
+                    la, lo = float(p[0]), float(p[1])
+                except (TypeError, ValueError, IndexError, KeyError):
+                    continue
+                if abs(la) <= 90 and abs(lo) <= 360 and (not out or out[-1] != (la, lo)):
+                    out.append((la, lo))
+    return out
+
+def live_point(spec, fc=()):
+    """発生中の台風 → (英語名, 実況点(時刻UTC, 緯度, 経度, 風速kt, 気圧), 過去軌跡[(lat, lon)])。実況が無ければ None。
+    実況は specifications.json（風速・気圧つき）を優先し、無ければ forecast.json の実況(advancedHours=0)を使う。
+    過去軌跡は forecast.json の実況に付いている track（時刻は持たない）。"""
+    en = _title_en(spec) or _title_en(fc)
+    pt, past = None, []
+    for r in spec:
+        p = r.get("part") if isinstance(r, dict) else None
+        if isinstance(p, dict) and p.get("jp") == "実況":
+            try:
+                lat, lon = r["position"]["deg"][:2]
+                w = num(((r.get("maximumWind") or {}).get("sustained") or {}).get("m/s"))
+                t = datetime.strptime(r["validtime"]["UTC"][:19], "%Y-%m-%dT%H:%M:%S")
+                pt = (t.strftime(F), float(lat), float(lon),
+                      round(w * MS2KT) if w else None, num(r.get("pressure")) or None)
+            except (KeyError, TypeError, ValueError, IndexError):
+                pass
+            break
+    for r in fc:
+        if isinstance(r, dict) and r.get("advancedHours") == 0:
+            past = past_track(r.get("track"))
+            if pt is None:
+                try:
+                    t = datetime.strptime(r["validtime"]["UTC"][:19], "%Y-%m-%dT%H:%M:%S")
+                    pt = (t.strftime(F), float(r["center"][0]), float(r["center"][1]), None, None)
+                except (KeyError, TypeError, ValueError, IndexError):
+                    pass
+            break
+    return (en, pt, past) if pt else None
+
+def merge_live(con, sid, year, no, en, pt, past=()):
+    """発生中の台風の実況を取り込む。
+    ・位置表PDF由来の点（無ければ同名のIBTrACS由来の点）があれば、それを土台にする
+    ・土台より古い側は、forecast.json の過去軌跡で補う（軌跡は時刻を持たないので、実況時刻から
+      TRACK_STEP_H 時間刻みで遡った推定時刻。位置表PDFが載れば、そちらの正しい値で置き換わる）
+    ・最新の実況1点を末尾に追記する
+    戻り値: 更新したか。"""
     sel = "SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time"
-    pts = con.execute(sel, (sid,)).fetchall()
-    if not pts and en:
+    old = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
+    if not old and en:
         alt = con.execute("SELECT sid FROM typhoons WHERE year=? AND name_en=? AND sid NOT LIKE 'JMA%'",
                           (year, en)).fetchone()
         if alt:
-            pts = con.execute(sel, (alt[0],)).fetchall()
-    if pts and pts[-1][0] >= pt[0]:
+            old = [tuple(p) for p in con.execute(sel, (alt[0],)).fetchall()]
+    trk = list(past)
+    if trk and abs(trk[-1][0] - pt[1]) < 0.05 and abs(trk[-1][1] - pt[2]) < 0.05:
+        trk.pop()  # 末尾が実況と同じ点なら重複させない
+    t1 = datetime.strptime(pt[0][:19], F)
+    back = [((t1 - timedelta(hours=TRACK_STEP_H * (len(trk) - i))).strftime(F), la, lo, None, None)
+            for i, (la, lo) in enumerate(trk)]
+    first = old[0][0] if old else pt[0]
+    new = [b for b in back if b[0] < first] + old
+    if not old or old[-1][0] < pt[0]:
+        new.append(pt)
+    if new == old:
         return False
     con.execute("DELETE FROM points WHERE sid=?", (sid,))
-    insert(con, sid, year, no, en, [tuple(p) for p in pts] + [pt], 1)
+    insert(con, sid, year, no, en, new, 1)
     return True
 
 def refresh_live(con):
     """発生中の台風を気象庁の防災情報JSONから取り込む（位置表PDFの掲載は遅れるため）。
-    注意: JSONのIDは TC2632 のように熱帯低気圧を含む通し番号で、台風の号数(typhoonNumber=2626)とは別。"""
+    注意: JSONのIDは TC2632 のように熱帯低気圧を含む通し番号で、台風の号数(typhoonNumber=2626)とは別。
+    1つの台風の失敗で他を止めない。"""
     r = requests.get(f"{BOSAI}/targetTc.json", headers=UA, timeout=30)
     r.raise_for_status()
+    lst = r.json()
+    print("JMA live list:", [(t.get("tropicalCyclone"), t.get("typhoonNumber"), t.get("category")) for t in lst], flush=True)
     n = 0
-    for t in r.json():
-        tn = str(t.get("typhoonNumber", ""))
-        if not re.fullmatch(r"\d{4}", tn):  # 熱帯低気圧(a,b…)は対象外
+    for t in lst:
+        tn, tc = str(t.get("typhoonNumber", "")), t.get("tropicalCyclone")
+        if not tc or not re.fullmatch(r"\d{4}", tn):  # 熱帯低気圧(号数なし)は対象外
             continue
         try:
-            s = requests.get(f"{BOSAI}/{t['tropicalCyclone']}/specifications.json", headers=UA, timeout=30)
-            s.raise_for_status()
-            got = live_point(s.json())
-            if got:
-                n += merge_live(con, f"JMA{tn}", 2000 + int(tn[:2]), int(tn[2:]), *got)
+            spec = get_json(f"{BOSAI}/{tc}/specifications.json", [])
+            fc = get_json(f"{BOSAI}/{tc}/forecast.json", [])
+            got = live_point(spec, fc)
+            if not got:
+                print(f"live {tc} (台風{tn}): 実況なし", flush=True)
+                continue
+            en, pt, past = got
+            n += merge_live(con, f"JMA{tn}", 2000 + int(tn[:2]), int(tn[2:]), en, pt, past)
         except Exception as e:
-            print(f"live {t.get('tropicalCyclone')} failed:", repr(e), flush=True)
+            print(f"live {tc} failed:", repr(e), flush=True)
     print(f"JMA live: {n} updated", flush=True)
+
+def dt_track(no6):
+    """デジタル台風のGeoJSON → (英語名, 点列[(時刻UTC, 緯度, 経度, 風速kt, 気圧)])。取れなければ None。
+    6桁番号は 西暦4桁+気象庁の号数2桁（例 202625）。点は3時間刻みで、熱帯低気圧の段階から温帯低気圧化まで含む。"""
+    j = get_json(f"{DT}/geojson/wnp/{no6}.en.json")
+    if not isinstance(j, dict):
+        return None
+    pts = []
+    for f in j.get("features") or []:
+        try:
+            p, (lon, lat) = f["properties"], f["geometry"]["coordinates"][:2]
+            t = datetime.fromtimestamp(int(p["time"]), timezone.utc).strftime(F)
+            pts.append((t, float(lat), float(lon), num(p.get("wind")) or None, num(p.get("pressure")) or None))
+        except (KeyError, TypeError, ValueError):
+            continue
+    pts.sort()
+    return ((j.get("properties") or {}).get("name") or "").strip().upper(), pts
+
+def refresh_dt(con, yr):
+    """位置表PDFが未掲載の台風（消滅直後など）を、デジタル台風から補う。
+    対象: 今年の号数のうち ①DBに無いもの ②以前ここから補ったもの（PDFが載るまで追いかける）。
+    PDF確定・速報が取れた台風は対象外。PDFが載れば refresh_pdf 側で置き換わる。"""
+    yy = str(yr)[2:]
+    html = requests.get(f"{DT}/year/wnp/{yr}.html.en", headers=UA, timeout=60).text
+    nums = sorted({int(n) for y, n in re.findall(r"/(\d{4})(\d{2})\.html", html) if y == str(yr)})
+    fin = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%' AND prov=0")}
+    have = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%'")}
+    pend = {r[0][3:] for r in con.execute("SELECT k FROM meta WHERE k LIKE 'dt:%'")}
+    todo = [n for n in nums if (f"JMA{yy}{n:02d}" not in have or f"JMA{yy}{n:02d}" in pend)
+            and f"JMA{yy}{n:02d}" not in fin]
+    with ThreadPoolExecutor(3) as ex:
+        got = list(ex.map(lambda n: (n, dt_track(f"{yr}{n:02d}")), todo))
+    sel = "SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time"
+    upd = 0
+    for n, g in got:
+        if not g or len(g[1]) < 2:
+            continue
+        en, pts = g
+        sid = f"JMA{yy}{n:02d}"
+        old = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
+        new = pts + [p for p in old if p[0] > pts[-1][0]]  # 防災情報JSONの実況がDTより新しければ残す
+        con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"dt:{sid}", pts[-1][0]))
+        if new != old:
+            con.execute("DELETE FROM points WHERE sid=?", (sid,))
+            insert(con, sid, yr, n, en, new, 1)
+            upd += 1
+    print(f"DT {yr}: {len(todo)} target, {upd} updated", flush=True)
 
 def dedupe(con):
     """気象庁データで置き換わった同名のIBTrACS由来データだけを消す（それ以外は残す）。"""
@@ -281,6 +398,10 @@ def refresh_recent():
                 refresh_pdf(con, yr); ok = True
             except Exception as e:
                 print(f"JMA table {yr} failed:", repr(e), flush=True)
+            try:
+                refresh_dt(con, yr); ok = True
+            except Exception as e:
+                print(f"DT {yr} failed:", repr(e), flush=True)
         try:
             refresh_live(con); ok = True
         except Exception as e:
@@ -293,6 +414,32 @@ def refresh_recent():
         print("refresh_recent failed:", repr(e), flush=True)
     finally:
         if con: con.close()
+
+def diag():
+    """python app.py diag : 台風が取れない時の切り分け用。JMA側の状態とDBの中身を表示する。"""
+    now = datetime.now(timezone(timedelta(hours=9))); yy = str(now.year)[2:]
+    print("== targetTc.json")
+    for t in get_json(f"{BOSAI}/targetTc.json", []):
+        tc = t.get("tropicalCyclone"); print(t)
+        got = live_point(get_json(f"{BOSAI}/{tc}/specifications.json", []), get_json(f"{BOSAI}/{tc}/forecast.json", []))
+        print("   ->", got and (got[0], got[1], f"過去軌跡{len(got[2])}点"))
+    print("== 位置表PDF")
+    for n in range(max(1, int(os.environ.get("DIAG_FROM", "20"))), 36):
+        try:
+            r = requests.get(f"{JMA}/data/T{yy}{n:02d}.pdf", headers=UA, timeout=30, stream=True); r.close()
+            print(f"T{yy}{n:02d}.pdf", r.status_code, r.headers.get("Last-Modified", ""))
+        except Exception as e:
+            print(f"T{yy}{n:02d}.pdf", repr(e))
+    print("== デジタル台風（PDF未掲載の補完元）")
+    for n in range(20, 36):
+        g = dt_track(f"{now.year}{n:02d}")
+        if g: print(f"{now.year}{n:02d}", g[0], f"{len(g[1])}点", g[1][-1][0] if g[1] else "")
+    print("== DB")
+    con = sqlite3.connect(DB)
+    for r in con.execute("SELECT sid, number, title, prov, start_time, end_time, (SELECT COUNT(*) FROM points p WHERE p.sid=t.sid) "
+                         "FROM typhoons t WHERE year=? ORDER BY number", (now.year,)):
+        print(r)
+    con.close()
 
 # ---------------- API ----------------
 @asynccontextmanager
@@ -539,6 +686,8 @@ setInterval(poll,5*60*1000);
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "build":
         build()
+    elif len(sys.argv) > 1 and sys.argv[1] == "diag":
+        diag()
     else:
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
