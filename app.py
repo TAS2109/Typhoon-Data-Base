@@ -3,6 +3,8 @@
   起動:    uvicorn app:app --host 0.0.0.0 --port $PORT   (DBが無ければ起動時に自動ビルド)
 表記: 「2026年台風第26号 Surigae」。号数は気象庁方式（熱帯低気圧の段階は数えず、
       台風の強さに初めて達した順に年ごとに採番）で再計算する。
+風速はm/s表示（DB内部はkt保持、API出力時に換算）。
+今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）で随時更新する。
 """
 import asyncio, csv, io, os, re, sqlite3, sys
 from contextlib import asynccontextmanager
@@ -19,6 +21,14 @@ SRC = os.environ.get("SOURCE_CSV")  # ローカルテスト用
 JMA = "https://www.data.jma.go.jp/typhoon"
 F = "%Y-%m-%d %H:%M:%S"
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "typhoon.db")
+BOSAI = "https://www.jma.go.jp/bosai/typhoon/data"  # 発生中の台風（防災情報JSON）
+UA = {"User-Agent": "typhoon-db/1.0"}
+INTERVAL = int(os.environ.get("REFRESH_MINUTES", "60")) * 60  # 速報の再取得間隔（秒）
+KT2MS, MS2KT = 0.514444, 1.94384
+
+def to_ms(kt):
+    """DBはkt保持。表示用にm/s（整数）へ換算する。m/s→kt→m/sは常に元の整数に戻る。"""
+    return None if kt is None else int(kt * KT2MS + 0.5)
 
 # 気象庁が正式に名称を付けた台風（年, 国際名）
 NICK = {(1954, "MARIE"): "洞爺丸台風", (1958, "IDA"): "狩野川台風", (1959, "SARAH"): "宮古島台風",
@@ -140,6 +150,7 @@ def parse_pdf(text):
     if not h:
         return None
     year, no, name = int(h[1]), int(h[2]), h[3].upper()
+    y0 = year  # 号数の年（年またぎでも変えない）
     mo = da = None; pts = []
     for ln in text.splitlines():
         r = ROW.match(ln.strip())
@@ -157,40 +168,128 @@ def parse_pdf(text):
             continue
         t = datetime(year, mo, da) + timedelta(hours=hr - 9)  # JST→UTC
         pres = None if r[6] == "--" else float(r[6])
-        wind = None if r[7] == "--" else round(int(r[7]) * 1.94384)  # m/s→kt
+        wind = None if r[7] == "--" else round(int(r[7]) * MS2KT)  # m/s→kt
         pts.append((t.strftime(F), float(r[4]), float(r[5]), wind, pres))
-    return (year, no, name, pts, "速報値" in text) if pts else None
+    return (y0, no, name, pts, "速報値" in text) if pts else None
 
-def fetch_pdf(c):
-    import pdfplumber
-    b = requests.get(f"{JMA}/data/T{c}.pdf", timeout=60).content
-    with pdfplumber.open(io.BytesIO(b)) as pdf:
-        return c, parse_pdf("\n".join(pg.extract_text() or "" for pg in pdf.pages))
+def fetch_pdf(c, since=None):
+    """位置表PDFを取得して解析。戻り値: (コード, 解析結果 or None, Last-Modified)。
+    未掲載(404)・変更なし(304)・解析失敗は None（1件の失敗で全体を止めない）。"""
+    try:
+        import pdfplumber
+        h = dict(UA, **({"If-Modified-Since": since} if since else {}))
+        r = requests.get(f"{JMA}/data/T{c}.pdf", headers=h, timeout=60)
+        if r.status_code != 200 or not r.content.startswith(b"%PDF"):
+            return c, None, None
+        with pdfplumber.open(io.BytesIO(r.content)) as pdf:
+            text = "\n".join(pg.extract_text() or "" for pg in pdf.pages)
+        res = parse_pdf(text)
+        if not res:
+            print(f"T{c}.pdf: parse failed", flush=True)
+        return c, res, r.headers.get("Last-Modified")
+    except Exception as e:
+        print(f"T{c}.pdf failed:", repr(e), flush=True)
+        return c, None, None
+
+def refresh_pdf(con, yr):
+    """位置表PDFから取り込む。確定済みは再取得せず、速報はLast-Modifiedが変わった時だけ取り直す。
+    一覧ページの掲載は遅れる（数号ぶん）ので、掲載済みの次の号のPDFも探す。"""
+    yy = str(yr)[2:]
+    html = requests.get(f"{JMA}/position_table/table{yr}.html", headers=UA, timeout=60).text
+    codes = sorted({c for c in re.findall(r"T(\d{4})\.pdf", html) if c[:2] == yy})
+    top = int(codes[-1][2:]) if codes else 0
+    codes += [f"{yy}{n:02d}" for n in range(top + 1, top + 4)]
+    done = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%' AND prov=0")}
+    have = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%'")}
+    lm = dict(con.execute("SELECT k, v FROM meta WHERE k LIKE 'lm:%'"))
+    todo = [c for c in codes if f"JMA{c}" not in done]
+    since = lambda c: lm.get(f"lm:{c}") if f"JMA{c}" in have else None
+    with ThreadPoolExecutor(4) as ex:
+        got = [g for g in ex.map(lambda c: fetch_pdf(c, since(c)), todo) if g[1]]
+    for c, (y, no, en, pts, prov), mod in got:
+        con.execute("DELETE FROM points WHERE sid=?", (f"JMA{c}",))
+        insert(con, f"JMA{c}", y, no, en, pts, int(prov))
+        if mod:
+            con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"lm:{c}", mod))
+    print(f"JMA {yr}: PDF {len(got)}/{len(todo)} updated", flush=True)
+
+def live_point(spec):
+    """specifications.json → (英語名, (時刻UTC, 緯度, 経度, 風速kt, 気圧))。実況が無ければ None。"""
+    title = next((r for r in spec if r.get("part") == "title"), {})
+    en = ((title.get("name") or {}).get("en") or "").strip().upper()
+    for r in spec:
+        p = r.get("part")
+        if isinstance(p, dict) and p.get("jp") == "実況":
+            lat, lon = r["position"]["deg"][:2]
+            w = num(((r.get("maximumWind") or {}).get("sustained") or {}).get("m/s"))
+            t = datetime.strptime(r["validtime"]["UTC"][:19], "%Y-%m-%dT%H:%M:%S")
+            return en, (t.strftime(F), float(lat), float(lon),
+                        round(w * MS2KT) if w else None, num(r.get("pressure")) or None)
+    return None
+
+def merge_live(con, sid, year, no, en, pt):
+    """発生中の台風の最新の実況1点を追記する。位置表PDF由来の点があればそれに続け、
+    無ければ同名のIBTrACS由来の点を引き継ぐ。戻り値: 追記したか。"""
+    sel = "SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time"
+    pts = con.execute(sel, (sid,)).fetchall()
+    if not pts and en:
+        alt = con.execute("SELECT sid FROM typhoons WHERE year=? AND name_en=? AND sid NOT LIKE 'JMA%'",
+                          (year, en)).fetchone()
+        if alt:
+            pts = con.execute(sel, (alt[0],)).fetchall()
+    if pts and pts[-1][0] >= pt[0]:
+        return False
+    con.execute("DELETE FROM points WHERE sid=?", (sid,))
+    insert(con, sid, year, no, en, [tuple(p) for p in pts] + [pt], 1)
+    return True
+
+def refresh_live(con):
+    """発生中の台風を気象庁の防災情報JSONから取り込む（位置表PDFの掲載は遅れるため）。
+    注意: JSONのIDは TC2632 のように熱帯低気圧を含む通し番号で、台風の号数(typhoonNumber=2626)とは別。"""
+    r = requests.get(f"{BOSAI}/targetTc.json", headers=UA, timeout=30)
+    r.raise_for_status()
+    n = 0
+    for t in r.json():
+        tn = str(t.get("typhoonNumber", ""))
+        if not re.fullmatch(r"\d{4}", tn):  # 熱帯低気圧(a,b…)は対象外
+            continue
+        try:
+            s = requests.get(f"{BOSAI}/{t['tropicalCyclone']}/specifications.json", headers=UA, timeout=30)
+            s.raise_for_status()
+            got = live_point(s.json())
+            if got:
+                n += merge_live(con, f"JMA{tn}", 2000 + int(tn[:2]), int(tn[2:]), *got)
+        except Exception as e:
+            print(f"live {t.get('tropicalCyclone')} failed:", repr(e), flush=True)
+    print(f"JMA live: {n} updated", flush=True)
+
+def dedupe(con):
+    """気象庁データで置き換わった同名のIBTrACS由来データだけを消す（それ以外は残す）。"""
+    dup = ("SELECT t.sid FROM typhoons t WHERE t.sid NOT LIKE 'JMA%' AND t.name_en<>'' AND EXISTS "
+           "(SELECT 1 FROM typhoons j WHERE j.sid LIKE 'JMA%' AND j.year=t.year AND j.name_en=t.name_en)")
+    con.execute(f"DELETE FROM points WHERE sid IN ({dup})")
+    con.execute(f"DELETE FROM typhoons WHERE sid IN ({dup})")
 
 def refresh_recent():
-    """今年の台風を気象庁の位置表PDFから取り込む。確定済みで取得済みのものは再取得しない。"""
-    con = None
+    """今年の台風を取り込む。PDFとJSONは別々に失敗しても、取れたぶんで動かす。"""
+    con, ok = None, False
     try:
-        yr = datetime.now().year
-        html = requests.get(f"{JMA}/position_table/table{yr}.html", timeout=60).text
-        codes = sorted({c for c in re.findall(r"T(\d{4})\.pdf", html) if c[:2] == str(yr)[2:]})
-        if not codes:
-            return
         con = sqlite3.connect(DB, timeout=60)
-        done = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%' AND prov=0")}
-        todo = [c for c in codes if f"JMA{c}" not in done]
-        with ThreadPoolExecutor(4) as ex:
-            got = [g for g in ex.map(fetch_pdf, todo) if g[1]]
-        if got:  # IBTrACS由来の今年ぶんは気象庁の値で置き換える
-            con.execute("DELETE FROM points WHERE sid IN (SELECT sid FROM typhoons WHERE year=? AND sid NOT LIKE 'JMA%')", (yr,))
-            con.execute("DELETE FROM typhoons WHERE year=? AND sid NOT LIKE 'JMA%'", (yr,))
-        for c, (y, no, en, pts, prov) in got:
-            con.execute("DELETE FROM points WHERE sid=?", (f"JMA{c}",))
-            insert(con, f"JMA{c}", y, no, en, pts, int(prov))
-        con.execute("INSERT OR REPLACE INTO meta VALUES('jma_at',?)", (datetime.now(timezone.utc).strftime(F),))
+        now = datetime.now(timezone(timedelta(hours=9)))
+        for yr in [now.year] + ([now.year - 1] if now.month == 1 else []):  # 1月は前年の台風も継続しうる
+            try:
+                refresh_pdf(con, yr); ok = True
+            except Exception as e:
+                print(f"JMA table {yr} failed:", repr(e), flush=True)
+        try:
+            refresh_live(con); ok = True
+        except Exception as e:
+            print("JMA live failed:", repr(e), flush=True)
+        dedupe(con)
+        if ok:
+            con.execute("INSERT OR REPLACE INTO meta VALUES('jma_at',?)", (datetime.now(timezone.utc).strftime(F),))
         con.commit()
-        print(f"JMA {yr}: {len(got)}/{len(todo)} fetched", flush=True)
-    except Exception as e:  # 速報の取得に失敗しても既存データで動かす
+    except Exception as e:
         print("refresh_recent failed:", repr(e), flush=True)
     finally:
         if con: con.close()
@@ -202,9 +301,9 @@ async def lifespan(_):
         await asyncio.to_thread(build)
 
     async def loop():
-        while True:  # 速報値は3時間ごとに再取得
+        while True:  # 速報値・発生中の台風を定期的に再取得（既定60分。REFRESH_MINUTESで変更可）
             await asyncio.to_thread(refresh_recent)
-            await asyncio.sleep(3 * 3600)
+            await asyncio.sleep(INTERVAL)
     task = asyncio.create_task(loop())
     yield
     task.cancel()
@@ -248,22 +347,25 @@ def typhoons(name: str | None = None, year_from: int | None = None, year_to: int
     if year_from is not None: add("year>=?", year_from)
     if year_to is not None: add("year<=?", year_to)
     if month is not None: add("month=?", month)
-    if wind_min is not None: add("max_wind>=?", wind_min)
-    if wind_max is not None: add("max_wind<=?", wind_max)
+    if wind_min is not None: add(f"CAST(max_wind*{KT2MS}+0.5 AS INTEGER)>=?", wind_min)  # m/s指定
+    if wind_max is not None: add(f"CAST(max_wind*{KT2MS}+0.5 AS INTEGER)<=?", wind_max)
     if pres_max is not None: add("min_pres<=?", pres_max)
     if days_min is not None: add("days>=?", days_min)
     if named: where.append("name_en<>''")
     w = ("WHERE " + " AND ".join(where)) if where else ""
     ob = SORTS.get(sort, SORTS["number"]).format(d="ASC" if order == "asc" else "DESC")
     total = q(f"SELECT COUNT(*) AS n FROM typhoons {w}", args)[0]["n"]
-    return {"total": total, "rows": q(f"SELECT * FROM typhoons {w} ORDER BY {ob} LIMIT ?", (*args, limit))}
+    rows = q(f"SELECT * FROM typhoons {w} ORDER BY {ob} LIMIT ?", (*args, limit))
+    for r in rows: r["max_wind"] = to_ms(r["max_wind"])
+    return {"total": total, "rows": rows}
 
 @app.get("/api/typhoons/{sid}")
 def detail(sid: str):
     t = q("SELECT * FROM typhoons WHERE sid=?", (sid,))
     if not t: raise HTTPException(404, "台風が見つかりません")
-    return {**t[0], "track": q(
-        "SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time", (sid,))}
+    track = q("SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time", (sid,))
+    for p in track: p["wind"] = to_ms(p["wind"])
+    return {**t[0], "max_wind": to_ms(t[0]["max_wind"]), "track": track}
 
 # ---------------- 画面 ----------------
 PAGE = r"""<!doctype html>
@@ -327,8 +429,8 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
   <form class="f" id="f" onsubmit="return false">
    <input class="wide" name="name" placeholder="名前・号数で検索（例: SURIGAE / 15号）">
    <div class="chips wide">
-    <button type="button" class="chip" data-w="">全ての強さ</button><button type="button" class="chip" data-w="64">強い〜</button>
-    <button type="button" class="chip" data-w="85">非常に強い〜</button><button type="button" class="chip" data-w="105">猛烈な</button></div>
+    <button type="button" class="chip" data-w="">全ての強さ</button><button type="button" class="chip" data-w="33">強い〜</button>
+    <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="name">名前順</option></select>
     <button type="button" id="dir" title="昇順・降順">↓</button><input type="hidden" name="order" value="desc"></div>
    <details><summary>詳細条件</summary><div class="f2">
@@ -336,8 +438,8 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
     <label>年（まで）<select name="year_to"><option value="">指定なし</option></select></label>
     <label>発生月<select name="month"><option value="">全て</option></select></label>
     <label>表示件数<select name="limit"><option>100</option><option selected>300</option><option>1000</option></select></label>
-    <label>最大風速 kt 以上<input type="number" name="wind_min" min="0"></label>
-    <label>最大風速 kt 以下<input type="number" name="wind_max" min="0"></label>
+    <label>最大風速 m/s 以上<input type="number" name="wind_min" min="0"></label>
+    <label>最大風速 m/s 以下<input type="number" name="wind_max" min="0"></label>
     <label>最低気圧 hPa 以下<input type="number" name="pres_max" placeholder="例: 930"></label>
     <label>継続日数 以上<input type="number" name="days_min" min="0" step="0.5"></label>
     <label class="chk"><input type="checkbox" name="named">名前付きのみ</label>
@@ -350,10 +452,10 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
 <main><div id="map"></div><div id="info" class="card" hidden></div><div id="legend" class="card"></div></main>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
-const CLS=[[105,"猛烈な","#ff4d7d"],[85,"非常に強い","#ff8a3d"],[64,"強い","#ffd24a"],[34,"台風","#4fc3f7"],[0,"熱帯低気圧","#64789a"]];
+const CLS=[[54,"猛烈な","#ff4d7d"],[44,"非常に強い","#ff8a3d"],[33,"強い","#ffd24a"],[17,"台風","#4fc3f7"],[0,"熱帯低気圧","#64789a"]];  // m/s
 const UNK=[null,"不明","#3d4f66"];
 const K=w=>w==null?UNK:CLS.find(c=>w>=c[0]), col=w=>K(w)[2], cls=w=>K(w)[1];
-const spd=w=>w==null?"-":`${w}kt（${Math.round(w*0.5144)}m/s）`;
+const spd=w=>w==null?"-":`${w}m/s`;
 const jst=(s,full)=>{const d=new Date(new Date(s.replace(" ","T")+"Z").getTime()+9*3600e3),z=n=>String(n).padStart(2,"0");
   return `${full?d.getUTCFullYear()+"/":""}${d.getUTCMonth()+1}/${d.getUTCDate()} ${z(d.getUTCHours())}時`};
 const $=s=>document.querySelector(s), f=$("#f"), chips=document.querySelectorAll(".chip");
@@ -366,11 +468,12 @@ L.tileLayer(ESRI+"World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",{pane:"l
 let layer=L.layerGroup().addTo(map), first=true;
 $("#legend").innerHTML=[...CLS,UNK].map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
 
+let jmaAt="";
 async function init(){
   const y=await (await fetch("/api/years")).json();
   for(let i=y.max;i>=y.min;i--){f.year_from.add(new Option(i+"年",i));f.year_to.add(new Option(i+"年",i))}
   for(let m=1;m<=12;m++) f.month.add(new Option(m+"月",m));
-  if(y.jma_at) $("#st").innerHTML=`速報 <b>${jst(y.jma_at)}</b> 更新`;
+  jmaAt=y.jma_at||"";if(jmaAt) $("#st").innerHTML=`速報 <b>${jst(jmaAt)}</b> 更新`;
   $("#reset").onclick=()=>{f.reset();f.order.value="desc";load()};
   $("#dir").onclick=()=>{f.order.value=f.order.value=="desc"?"asc":"desc";load()};
   chips.forEach(c=>c.onclick=()=>{f.wind_min.value=c.dataset.w;f.wind_max.value="";load()});
@@ -388,16 +491,16 @@ async function load(){
     $("#count").textContent=total?`${total}件`+(total>rows.length?`中 ${rows.length}件を表示（件数を増やすか条件を絞ってください）`:""):"該当なし。条件を変えてください";
     $("#list").innerHTML=rows.map(r=>`<li data-sid="${r.sid}"><span class="bar" style="background:${col(r.max_wind)}"></span>
      <div class="t"><b>${r.title}${r.prov?"<em>速報</em>":""}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日</span>
-     <div class="m"><i style="width:${Math.min(100,(r.max_wind||0)/1.3)}%;background:${col(r.max_wind)}"></i></div></div>
-     <div class="v"><strong>${r.max_wind??"-"}</strong><small>kt</small><small>${r.min_pres??"-"}hPa</small></div></li>`).join("");
+     <div class="m"><i style="width:${Math.min(100,(r.max_wind||0)/0.67)}%;background:${col(r.max_wind)}"></i></div></div>
+     <div class="v"><strong>${r.max_wind??"-"}</strong><small>m/s</small><small>${r.min_pres??"-"}hPa</small></div></li>`).join("");
     if(first){first=false;const s=location.hash.slice(1)||(rows[0]&&rows[0].sid);if(s)show(s)}  // 共有リンク or 最新の台風を自動表示
   }catch(e){$("#count").textContent="読み込みに失敗しました。再読み込みしてください"}
 }
 $("#list").addEventListener("click",e=>{const li=e.target.closest("li");if(li)show(li.dataset.sid,li)});
-async function show(sid,li){
+async function show(sid,li,keep){
   document.querySelectorAll("#list li.on").forEach(x=>x.classList.remove("on"));
   li=li||document.querySelector(`#list li[data-sid="${sid}"]`);
-  if(li){li.classList.add("on");li.scrollIntoView({block:"nearest"})}
+  if(li){li.classList.add("on");if(!keep)li.scrollIntoView({block:"nearest"})}
   history.replaceState(null,"","#"+sid);
   const r=await fetch("/api/typhoons/"+sid);if(!r.ok)return;
   const t=await r.json();
@@ -409,16 +512,27 @@ async function show(sid,li){
   for(let i=1;i<pts.length;i++) L.polyline([ll[i-1],ll[i]],{color:col(pts[i].wind),weight:4,lineCap:"round"}).addTo(layer);
   pts.forEach((p,i)=>L.circleMarker(ll[i],{radius:i==0||i==pts.length-1?6:3,color:"#fff",weight:1,fillColor:col(p.wind),fillOpacity:1})
     .bindTooltip(`${i==0?"発生 ":i==pts.length-1?"終了 ":""}${jst(p.time,1)}<br>${spd(p.wind)} / ${p.pres??"-"}hPa`).addTo(layer));
-  map.fitBounds(L.latLngBounds(ll).pad(.3));
+  if(!keep)map.fitBounds(L.latLngBounds(ll).pad(.3));
   const i=$("#info");i.hidden=false;
   i.innerHTML=`<h2>${t.title}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2>
    <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）</div>
-   <div class="g"><div><small>最大風速</small><strong>${t.max_wind??"-"}<span> kt</span></strong></div>
+   <div class="g"><div><small>最大風速</small><strong>${t.max_wind??"-"}<span> m/s</span></strong></div>
    <div><small>強さ</small><strong style="color:${col(t.max_wind)}">${cls(t.max_wind)}</strong></div>
    <div><small>最低気圧</small><strong>${t.min_pres??"-"}<span> hPa</span></strong></div>
    <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div></div>`;
 }
 init();
+// 開いたままでも、サーバー側で速報が更新されたら一覧と表示中の台風を自動で更新する
+async function poll(){
+  try{
+    const y=await (await fetch("/api/years")).json();
+    if(y.jma_at&&y.jma_at!==jmaAt){
+      jmaAt=y.jma_at;$("#st").innerHTML=`速報 <b>${jst(jmaAt)}</b> 更新`;
+      await load();const s=location.hash.slice(1);if(s)show(s,null,true);
+    }
+  }catch(e){}
+}
+setInterval(poll,5*60*1000);
 </script></body></html>
 """
 
