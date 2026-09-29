@@ -517,14 +517,15 @@ def detail(sid: str):
 # ---------------- 画面 ----------------
 PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a1120">
 <title>台風データベース</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Zen+Kaku+Gothic+New:wght@400;700;900&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0a1120;--s1:#101a30;--s2:#17233f;--line:#22314f;--ink:#e9eefb;--sub:#8b9bbb;--acc:#38bdf8;--r:14px}
-*{box-sizing:border-box}
-body{margin:0;height:100dvh;display:grid;grid-template-columns:400px 1fr;background:var(--bg);color:var(--ink);font:14px/1.5 "Zen Kaku Gothic New",system-ui,sans-serif}
+:root{--bg:#0a1120;--s1:#101a30;--s2:#17233f;--line:#22314f;--ink:#e9eefb;--sub:#8b9bbb;--acc:#38bdf8;--r:14px;--mh:44dvh}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;height:100dvh;display:grid;grid-template-columns:400px 1fr;background:var(--bg);color:var(--ink);font:14px/1.5 "Zen Kaku Gothic New",system-ui,sans-serif;overflow:hidden}
 aside{display:flex;flex-direction:column;min-height:0;background:var(--s1);border-right:1px solid var(--line)}
 header{padding:18px 16px 10px;display:grid;gap:10px}
 .top{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -547,8 +548,9 @@ summary{cursor:pointer;color:var(--sub);font-size:13px;padding:2px 0}
 .f label.chk{flex-direction:row;align-items:center;gap:6px}
 #reset{border-radius:10px}
 :focus-visible{outline:2px solid var(--acc);outline-offset:1px}
-#count{padding:0 16px 8px;color:var(--sub);font-size:12px}
-#list{flex:1;overflow:auto;margin:0;padding:0 10px 10px;list-style:none;display:grid;gap:6px;align-content:start}
+#count{padding:0 16px 8px;color:var(--sub);font-size:12px;transition:opacity .2s}
+#count.busy{opacity:.5}
+#list{flex:1;overflow:auto;overscroll-behavior:contain;margin:0;padding:0 10px 10px;list-style:none;display:grid;gap:6px;align-content:start;-webkit-overflow-scrolling:touch}
 #list li{display:flex;gap:12px;align-items:center;padding:10px 12px;border-radius:12px;background:transparent;cursor:pointer;border:1px solid transparent}
 #list li:hover{background:var(--s2)}#list li.on{background:var(--s2);border-color:var(--acc)}
 .bar{width:4px;align-self:stretch;border-radius:4px;flex:none}
@@ -559,22 +561,52 @@ summary{cursor:pointer;color:var(--sub);font-size:13px;padding:2px 0}
 .v{text-align:right;line-height:1.2}.v strong{font:700 20px "Space Grotesk",sans-serif}.v small{display:block;color:var(--sub);font-size:11px}
 footer{padding:8px 16px;border-top:1px solid var(--line);color:var(--sub);font-size:11px}
 main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
-.card{position:absolute;z-index:500;background:rgba(16,26,48,.88);backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:var(--r)}
-#info{right:14px;top:14px;padding:14px 16px;width:300px;max-width:calc(100% - 28px)}
-#info h2{margin:0 0 2px;font-size:17px}#info .sub{color:var(--sub);font-size:12px}
-.g{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
-.g div{background:var(--s2);border-radius:10px;padding:8px 10px}
+.card{position:absolute;z-index:500;background:rgba(16,26,48,.9);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:var(--r)}
+#info{right:14px;top:14px;padding:12px 14px;width:320px;max-width:calc(100% - 28px)}
+.hd{display:flex;align-items:flex-start;gap:6px}.hd h2{flex:1;margin:0;font-size:17px;min-width:0}
+.ib{flex:none;width:34px;height:34px;border:0;border-radius:10px;background:var(--s2);cursor:pointer;font-size:15px;line-height:1}
+.ib:active{background:var(--acc);color:#04121f}
+#info .sub{color:var(--sub);font-size:12px}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.g div{background:var(--s2);border-radius:10px;padding:6px 10px}
 .g small{display:block;color:var(--sub);font-size:11px}.g strong{font:700 17px "Space Grotesk",sans-serif}.g strong span{font-size:11px;font-weight:400;color:var(--sub)}
+.pl{display:flex;align-items:center;gap:8px;margin-top:10px}
+#play{width:38px;height:38px;border-radius:50%;background:var(--acc);color:#04121f}
+.chart{flex:1;min-width:0;position:relative}
+.chart svg{display:block;width:100%;height:40px}
+#scrub{width:100%;margin:0;accent-color:var(--acc);height:20px}
+#rd{font-size:12px;color:var(--sub);margin-top:4px;font-variant-numeric:tabular-nums}
 #legend{left:14px;bottom:24px;padding:8px 12px;font-size:12px}
 #legend div{display:flex;gap:8px;align-items:center}#legend i{width:14px;height:4px;border-radius:2px;display:inline-block}
+#tog{display:none}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--s2);border:1px solid var(--line);padding:8px 16px;border-radius:99px;font-size:13px;z-index:2000;opacity:0;pointer-events:none;transition:opacity .2s}
+#toast.on{opacity:1}
 .leaflet-tooltip{background:var(--s1);color:var(--ink);border:1px solid var(--line);border-radius:8px}
-@media(max-width:760px){body{grid-template-columns:1fr;grid-template-rows:42dvh 1fr}aside{order:2;border:0}main{order:1}#info{width:auto;left:10px;right:10px;top:auto;bottom:10px;padding:10px 12px}.g{margin-top:8px}#legend{display:none}}
+.leaflet-control-attribution{font-size:9px}
+@media(max-width:760px){
+ body{grid-template-columns:1fr;grid-template-rows:var(--mh) 1fr;transition:grid-template-rows .25s}
+ body.big{--mh:calc(100dvh - 190px)}
+ aside{order:2;border:0;padding-bottom:env(safe-area-inset-bottom)}main{order:1}
+ header{padding:10px 12px 6px;gap:8px}h1{font-size:17px}footer{display:none}
+ .f input:not([type=checkbox]),.f select{font-size:16px;padding:11px 12px}  /* iOSの自動ズーム防止 */
+ .chips{flex-wrap:nowrap;overflow-x:auto;margin:0 -12px;padding:0 12px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
+ .chip{flex:none;padding:8px 14px;font-size:13px}#dir{min-width:48px}#reset{padding:11px}
+ #count{padding:0 12px 6px}#list{padding:0 8px 12px}#list li{padding:12px}
+ #info{left:10px;right:10px;top:auto;bottom:10px;width:auto;max-width:none;padding:10px 12px;padding-left:max(12px,env(safe-area-inset-left))}
+ .hd h2{font-size:15px}.ib{width:38px;height:38px}
+ .g{grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}.g div{padding:4px 8px}.g strong{font-size:14px}.g small{font-size:10px}
+ #legend{left:10px;top:10px;bottom:auto;display:flex;gap:10px;padding:5px 10px;font-size:10px;max-width:calc(100% - 100px);overflow-x:auto}
+ #legend div{flex:none;gap:4px}
+ #tog{display:block;position:absolute;z-index:600;right:10px;top:10px;padding:8px 14px;background:var(--acc);color:#04121f;font-weight:700;border:0;border-radius:99px;font-size:13px}
+ .leaflet-bottom.leaflet-right{margin-bottom:0}
+}
+@media(max-width:760px) and (max-height:520px){#info .g{display:none}}
 </style></head><body>
 <aside>
  <header>
   <div class="top"><h1>台風データベース</h1><span class="pill" id="st"></span></div>
   <form class="f" id="f" onsubmit="return false">
-   <input class="wide" name="name" placeholder="名前・号数で検索（例: SURIGAE / 15号）">
+   <input class="wide" name="name" type="search" enterkeyhint="search" autocomplete="off" placeholder="名前・号数で検索（例: SURIGAE / 15号）">
    <div class="chips wide">
     <button type="button" class="chip" data-w="">全ての強さ</button><button type="button" class="chip" data-w="33">強い〜</button>
     <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
@@ -585,10 +617,10 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
     <label>年（まで）<select name="year_to"><option value="">指定なし</option></select></label>
     <label>発生月<select name="month"><option value="">全て</option></select></label>
     <label>表示件数<select name="limit"><option>100</option><option selected>300</option><option>1000</option></select></label>
-    <label>最大風速 m/s 以上<input type="number" name="wind_min" min="0"></label>
-    <label>最大風速 m/s 以下<input type="number" name="wind_max" min="0"></label>
-    <label>最低気圧 hPa 以下<input type="number" name="pres_max" placeholder="例: 930"></label>
-    <label>継続日数 以上<input type="number" name="days_min" min="0" step="0.5"></label>
+    <label>最大風速 m/s 以上<input type="number" inputmode="numeric" name="wind_min" min="0"></label>
+    <label>最大風速 m/s 以下<input type="number" inputmode="numeric" name="wind_max" min="0"></label>
+    <label>最低気圧 hPa 以下<input type="number" inputmode="numeric" name="pres_max" placeholder="例: 930"></label>
+    <label>継続日数 以上<input type="number" inputmode="decimal" name="days_min" min="0" step="0.5"></label>
     <label class="chk"><input type="checkbox" name="named">名前付きのみ</label>
     <button type="button" id="reset">条件をリセット</button>
    </div></details>
@@ -596,61 +628,96 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
  <div id="count"></div><ul id="list"></ul>
  <footer>出典: 気象庁（ベストトラック／位置表。IBTrACS経由）。風速は10分平均、時刻は日本時間。「速報」は速報値で後日修正されます。</footer>
 </aside>
-<main><div id="map"></div><div id="info" class="card" hidden></div><div id="legend" class="card"></div></main>
+<main><div id="map"></div><button id="tog" type="button">地図を広げる</button><div id="info" class="card" hidden></div><div id="legend" class="card"></div></main>
+<div id="toast"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const CLS=[[54,"猛烈な","#ff4d7d"],[44,"非常に強い","#ff8a3d"],[33,"強い","#ffd24a"],[17,"台風","#4fc3f7"],[0,"熱帯低気圧","#64789a"]];  // m/s
 const UNK=[null,"不明","#3d4f66"];
 const K=w=>w==null?UNK:CLS.find(c=>w>=c[0]), col=w=>K(w)[2], cls=w=>K(w)[1];
 const spd=w=>w==null?"-":`${w}m/s`;
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const jst=(s,full)=>{const d=new Date(new Date(s.replace(" ","T")+"Z").getTime()+9*3600e3),z=n=>String(n).padStart(2,"0");
   return `${full?d.getUTCFullYear()+"/":""}${d.getUTCMonth()+1}/${d.getUTCDate()} ${z(d.getUTCHours())}時`};
 const $=s=>document.querySelector(s), f=$("#f"), chips=document.querySelectorAll(".chip");
+const mobile=()=>matchMedia("(max-width:760px)").matches;
+const store={get(){try{return JSON.parse(localStorage.getItem("tf")||"{}")}catch(e){return{}}},set(v){try{localStorage.setItem("tf",JSON.stringify(v))}catch(e){}}};
+function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("on");clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove("on"),1800)}
+const km=(a,b)=>{const r=Math.PI/180,dl=(b[1]-a[1])*r,p1=a[0]*r,p2=b[0]*r;
+  return 6371*Math.acos(Math.min(1,Math.sin(p1)*Math.sin(p2)+Math.cos(p1)*Math.cos(p2)*Math.cos(dl)))};
 const map=L.map("map",{worldCopyJump:true,zoomControl:false}).setView([25,135],4);
 L.control.zoom({position:"bottomright"}).addTo(map);
 const ESRI="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/";
 L.tileLayer(ESRI+"World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",{attribution:"Tiles © Esri — Esri, DeLorme, NAVTEQ | 気象庁 / IBTrACS (NOAA)",maxZoom:12}).addTo(map);
 map.createPane("labels").style.zIndex=450;map.getPane("labels").style.pointerEvents="none";
 L.tileLayer(ESRI+"World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",{pane:"labels",maxZoom:12}).addTo(map);
-let layer=L.layerGroup().addTo(map), first=true;
+let layer=L.layerGroup().addTo(map), first=true, cur=null, playT=null;
 $("#legend").innerHTML=[...CLS,UNK].map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
+// 地図の拡大/縮小（スマホ）
+$("#tog").onclick=()=>{const b=document.body.classList.toggle("big");$("#tog").textContent=b?"一覧を見る":"地図を広げる";
+  setTimeout(()=>{map.invalidateSize();if(cur)map.fitBounds(cur.bounds,fitOpt())},300)};
+addEventListener("resize",()=>map.invalidateSize());
+const fitOpt=()=>mobile()?{paddingTopLeft:[20,40],paddingBottomRight:[20,150]}:{padding:[40,40],paddingBottomRight:[360,40]};
 
 let jmaAt="";
 async function init(){
   const y=await (await fetch("/api/years")).json();
   for(let i=y.max;i>=y.min;i--){f.year_from.add(new Option(i+"年",i));f.year_to.add(new Option(i+"年",i))}
   for(let m=1;m<=12;m++) f.month.add(new Option(m+"月",m));
+  const sv=store.get();for(const k in sv) if(f[k]&&f[k].type!="checkbox") f[k].value=sv[k];  // 前回の絞り込みを復元
+  f.named.checked=sv.named==="true";
   jmaAt=y.jma_at||"";if(jmaAt) $("#st").innerHTML=`速報 <b>${jst(jmaAt)}</b> 更新`;
   $("#reset").onclick=()=>{f.reset();f.order.value="desc";load()};
   $("#dir").onclick=()=>{f.order.value=f.order.value=="desc"?"asc":"desc";load()};
   chips.forEach(c=>c.onclick=()=>{f.wind_min.value=c.dataset.w;f.wind_max.value="";load()});
-  f.addEventListener("input",()=>{clearTimeout(init.t);init.t=setTimeout(load,250)});
+  f.addEventListener("input",e=>{if(e.isComposing)return;clearTimeout(init.t);init.t=setTimeout(load,250)});
+  f.addEventListener("compositionend",()=>{clearTimeout(init.t);init.t=setTimeout(load,250)});  // 日本語入力の確定後に検索
   load();
 }
+let ctl;
 async function load(){
   const p=new URLSearchParams();
   for(const k of ["name","year_from","year_to","month","wind_min","wind_max","pres_max","days_min","sort","order","limit"]) if(f[k].value) p.set(k,f[k].value);
   if(f.named.checked) p.set("named","true");
+  store.set(Object.fromEntries(p));
   chips.forEach(c=>c.classList.toggle("on",c.dataset.w===f.wind_min.value&&!f.wind_max.value));
   $("#dir").textContent=f.order.value=="desc"?"↓":"↑";
+  ctl&&ctl.abort();ctl=new AbortController();$("#count").classList.add("busy");  // 古いリクエストを破棄
   try{
-    const {total,rows}=await (await fetch("/api/typhoons?"+p)).json();
+    const {total,rows}=await (await fetch("/api/typhoons?"+p,{signal:ctl.signal})).json();
+    $("#count").classList.remove("busy");
     $("#count").textContent=total?`${total}件`+(total>rows.length?`中 ${rows.length}件を表示（件数を増やすか条件を絞ってください）`:""):"該当なし。条件を変えてください";
-    $("#list").innerHTML=rows.map(r=>`<li data-sid="${r.sid}"><span class="bar" style="background:${col(r.max_wind)}"></span>
-     <div class="t"><b>${r.title}${r.prov?"<em>速報</em>":""}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日</span>
+    $("#list").innerHTML=rows.map(r=>`<li data-sid="${esc(r.sid)}"><span class="bar" style="background:${col(r.max_wind)}"></span>
+     <div class="t"><b>${esc(r.title)}${r.prov?"<em>速報</em>":""}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日</span>
      <div class="m"><i style="width:${Math.min(100,(r.max_wind||0)/0.67)}%;background:${col(r.max_wind)}"></i></div></div>
      <div class="v"><strong>${r.max_wind??"-"}</strong><small>m/s</small><small>${r.min_pres??"-"}hPa</small></div></li>`).join("");
-    if(first){first=false;const s=location.hash.slice(1)||(rows[0]&&rows[0].sid);if(s)show(s)}  // 共有リンク or 最新の台風を自動表示
-  }catch(e){$("#count").textContent="読み込みに失敗しました。再読み込みしてください"}
+    const s0=location.hash.slice(1);const on=s0&&$(`#list li[data-sid="${CSS.escape(s0)}"]`);if(on)on.classList.add("on");
+    if(first){first=false;const s=s0||(rows[0]&&rows[0].sid);if(s)show(s)}  // 共有リンク or 最新の台風を自動表示
+  }catch(e){if(e.name!="AbortError"){$("#count").classList.remove("busy");$("#count").textContent="読み込みに失敗しました。再読み込みしてください"}}
 }
 $("#list").addEventListener("click",e=>{const li=e.target.closest("li");if(li)show(li.dataset.sid,li)});
+function nav(d){const a=[...document.querySelectorAll("#list li")],i=a.findIndex(x=>x.classList.contains("on")),n=a[i+d];if(n)show(n.dataset.sid,n)}
+addEventListener("keydown",e=>{if(/INPUT|SELECT|TEXTAREA/.test(e.target.tagName))return;
+  if(e.key=="ArrowDown"||e.key=="j"){e.preventDefault();nav(1)}else if(e.key=="ArrowUp"||e.key=="k"){e.preventDefault();nav(-1)}else if(e.key==" "&&cur){e.preventDefault();play()}});
+// 進行アニメーション
+function setPos(i){if(!cur)return;cur.i=i;const p=cur.pts[i];cur.mk.setLatLng(cur.ll[i]);
+  $("#scrub").value=i;$("#rd").textContent=`${jst(p.time,1)} ・ ${spd(p.wind)} ・ ${p.pres??"-"}hPa`;
+  const c=$("#cur");if(c){c.setAttribute("x1",cur.xs[i]);c.setAttribute("x2",cur.xs[i])}
+  if(!map.getBounds().pad(-.1).contains(cur.ll[i]))map.panTo(cur.ll[i])}
+function stop(){clearInterval(playT);playT=null;const b=$("#play");if(b)b.textContent="▶"}
+function play(){if(!cur)return;if(playT)return stop();$("#play").textContent="❚❚";if(cur.i>=cur.pts.length-1)setPos(0);
+  playT=setInterval(()=>{if(cur.i>=cur.pts.length-1)return stop();setPos(cur.i+1)},Math.max(60,Math.min(250,6000/cur.pts.length)))}
+async function share(){const u=location.href,t=$("#info h2").textContent;
+  try{if(navigator.share)await navigator.share({title:t,url:u});else{await navigator.clipboard.writeText(u);toast("リンクをコピーしました")}}catch(e){}}
+let seq=0;
 async function show(sid,li,keep){
+  const my=++seq;stop();
   document.querySelectorAll("#list li.on").forEach(x=>x.classList.remove("on"));
-  li=li||document.querySelector(`#list li[data-sid="${sid}"]`);
+  li=li||document.querySelector(`#list li[data-sid="${CSS.escape(sid)}"]`);
   if(li){li.classList.add("on");if(!keep)li.scrollIntoView({block:"nearest"})}
   history.replaceState(null,"","#"+sid);
-  const r=await fetch("/api/typhoons/"+sid);if(!r.ok)return;
-  const t=await r.json();
+  const r=await fetch("/api/typhoons/"+encodeURIComponent(sid));if(!r.ok||my!=seq)return;
+  const t=await r.json();if(my!=seq)return;
   layer.clearLayers();
   const pts=t.track;
   // 日付変更線をまたぐ場合に備えて経度を連続化
@@ -659,14 +726,27 @@ async function show(sid,li,keep){
   for(let i=1;i<pts.length;i++) L.polyline([ll[i-1],ll[i]],{color:col(pts[i].wind),weight:4,lineCap:"round"}).addTo(layer);
   pts.forEach((p,i)=>L.circleMarker(ll[i],{radius:i==0||i==pts.length-1?6:3,color:"#fff",weight:1,fillColor:col(p.wind),fillOpacity:1})
     .bindTooltip(`${i==0?"発生 ":i==pts.length-1?"終了 ":""}${jst(p.time,1)}<br>${spd(p.wind)} / ${p.pres??"-"}hPa`).addTo(layer));
-  if(!keep)map.fitBounds(L.latLngBounds(ll).pad(.3));
+  const n=pts.length,W=300,xs=pts.map((_,i)=>n>1?i/(n-1)*W:0),mw=Math.max(1,...pts.map(p=>p.wind||0));
+  const wl=pts.map((p,i)=>p.wind==null?null:`${xs[i].toFixed(1)},${(38-p.wind/mw*34).toFixed(1)}`).filter(Boolean).join(" ");
+  const dist=Math.round(ll.slice(1).reduce((s,p,i)=>s+km(ll[i],p),0)/10)*10;
+  cur={pts,ll,xs,i:0,bounds:L.latLngBounds(ll),mk:L.circleMarker(ll[0],{radius:9,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:.9,interactive:false}).addTo(layer)};
+  if(!keep)map.fitBounds(cur.bounds,fitOpt());
   const i=$("#info");i.hidden=false;
-  i.innerHTML=`<h2>${t.title}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2>
-   <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）</div>
+  i.innerHTML=`<div class="hd"><h2>${esc(t.title)}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2>
+    <button class="ib" onclick="nav(-1)" aria-label="前の台風">◀</button><button class="ib" onclick="nav(1)" aria-label="次の台風">▶</button>
+    <button class="ib" onclick="share()" aria-label="共有">⤴</button><button class="ib" onclick="$('#info').hidden=true;stop()" aria-label="閉じる">✕</button></div>
+   <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）${dist?` ・ 約${dist.toLocaleString()}km`:""}</div>
    <div class="g"><div><small>最大風速</small><strong>${t.max_wind??"-"}<span> m/s</span></strong></div>
    <div><small>強さ</small><strong style="color:${col(t.max_wind)}">${cls(t.max_wind)}</strong></div>
    <div><small>最低気圧</small><strong>${t.min_pres??"-"}<span> hPa</span></strong></div>
-   <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div></div>`;
+   <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div></div>
+   <div class="pl"><button class="ib" id="play" onclick="play()" aria-label="再生">▶</button><div class="chart">
+    <svg viewBox="0 0 ${W} 40" preserveAspectRatio="none"><polyline points="${wl}" fill="none" stroke="${col(t.max_wind)}" stroke-width="2" vector-effect="non-scaling-stroke"/>
+    <line id="cur" x1="0" x2="0" y1="0" y2="40" stroke="#fff" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
+    <input id="scrub" type="range" min="0" max="${Math.max(0,n-1)}" value="0" aria-label="時刻"></div></div>
+   <div id="rd"></div>`;
+  $("#scrub").oninput=e=>{stop();setPos(+e.target.value)};
+  setPos(0);
 }
 init();
 // 開いたままでも、サーバー側で速報が更新されたら一覧と表示中の台風を自動で更新する
@@ -680,6 +760,7 @@ async function poll(){
   }catch(e){}
 }
 setInterval(poll,5*60*1000);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)poll()});  // スマホでアプリに戻った時にも確認
 </script></body></html>
 """
 
