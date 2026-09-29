@@ -8,6 +8,8 @@ import asyncio, csv, io, os, re, sqlite3, sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import requests
+from concurrent.futures import ThreadPoolExecutor
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
@@ -40,8 +42,11 @@ def num(v):
 def jst(iso):
     return datetime.strptime(iso[:19], "%Y-%m-%d %H:%M:%S") + timedelta(hours=9)
 
+NEED = ("SID", "NAME", "ISO_TIME", "TRACK_TYPE", "TOKYO_LAT", "TOKYO_LON",
+        "TOKYO_GRADE", "TOKYO_WIND", "TOKYO_PRES")
+
 def load_rows():
-    """CSVを1行ずつ流し読みする（全体をメモリに載せない）。"""
+    """CSVを流し読みし、必要な列だけの辞書を返す（列番号で読むのでDictReaderより高速）。"""
     def lines():
         if SRC:
             with open(SRC, encoding="utf-8") as f:
@@ -51,10 +56,16 @@ def load_rows():
             with requests.get(URL, stream=True, timeout=300) as r:
                 r.raise_for_status()
                 r.encoding = "utf-8"
-                yield from r.iter_lines(decode_unicode=True)
-    rd = csv.DictReader(lines())
-    next(rd)  # 2行目は単位行
-    return rd
+                yield from r.iter_lines(chunk_size=1 << 20, decode_unicode=True)
+    it = lines()
+    head = next(csv.reader([next(it)]))
+    next(it)  # 2行目は単位行
+    idx = [(k, head.index(k)) for k in NEED if k in head]
+    last = max(i for _, i in idx)
+    # SIDは先頭が西暦。気象庁の号数は1951年からなので、それ以前は読み飛ばす
+    for row in csv.reader(ln for ln in it if ln[:4] >= "1951"):
+        if len(row) > last:
+            yield {k: row[i] for k, i in idx}
 
 def insert(con, sid, year, no, en, p, prov=0):
     """p: [(time_utc, lat, lon, wind_kt, pres_hPa), ...] を1台風ぶんDBへ書き込む。"""
@@ -76,9 +87,8 @@ def build():
         start_time TEXT, end_time TEXT, max_wind REAL, min_pres REAL, month INT, days REAL, prov INT);
     CREATE TABLE points(sid TEXT, time TEXT, lat REAL, lon REAL, wind REAL, pres REAL);
     CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
-    CREATE INDEX idx_points_sid ON points(sid);
-    CREATE INDEX idx_ty_year ON typhoons(year, number);
     """)
+    con.executescript("PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF;")  # ビルド専用の一時DBなので高速化
     metas = []
 
     def flush(m, p):
@@ -114,11 +124,11 @@ def build():
         y = m["t0"].year
         seq[y] = seq.get(y, 0) + 1
         insert(con, m["sid"], y, seq[y], m["en"], m["p"])
+    con.executescript("CREATE INDEX idx_points_sid ON points(sid); CREATE INDEX idx_ty_year ON typhoons(year, number);")
     con.execute("INSERT INTO meta VALUES('built_at',?)", (datetime.now().strftime("%Y-%m-%d"),))
     con.commit(); con.close()
     os.replace(tmp, DB)
-    print(f"Done: {len(metas)} typhoons")
-    refresh_recent()
+    print(f"Done: {len(metas)} typhoons（今年の速報値は起動後に自動で取り込みます）")
 
 # ---------------- 気象庁の速報値（今年ぶん） ----------------
 HEAD = re.compile(r"(\d{4})年台風第\s*(\d+)号\s+([A-Za-z][A-Za-z\-]*)")
@@ -151,33 +161,39 @@ def parse_pdf(text):
         pts.append((t.strftime(F), float(r[4]), float(r[5]), wind, pres))
     return (year, no, name, pts, "速報値" in text) if pts else None
 
+def fetch_pdf(c):
+    import pdfplumber
+    b = requests.get(f"{JMA}/data/T{c}.pdf", timeout=60).content
+    with pdfplumber.open(io.BytesIO(b)) as pdf:
+        return c, parse_pdf("\n".join(pg.extract_text() or "" for pg in pdf.pages))
+
 def refresh_recent():
-    """今年の台風を気象庁の位置表PDFから取り込み、IBTrACS由来の今年ぶんと置き換える。"""
+    """今年の台風を気象庁の位置表PDFから取り込む。確定済みで取得済みのものは再取得しない。"""
+    con = None
     try:
-        import pdfplumber
         yr = datetime.now().year
         html = requests.get(f"{JMA}/position_table/table{yr}.html", timeout=60).text
-        got = []
-        for c in sorted(set(re.findall(r"T(\d{4})\.pdf", html))):
-            if c[:2] != str(yr)[2:]:
-                continue
-            b = requests.get(f"{JMA}/data/T{c}.pdf", timeout=60).content
-            with pdfplumber.open(io.BytesIO(b)) as pdf:
-                res = parse_pdf("\n".join(pg.extract_text() or "" for pg in pdf.pages))
-            if res: got.append((c, res))
-        if not got:
+        codes = sorted({c for c in re.findall(r"T(\d{4})\.pdf", html) if c[:2] == str(yr)[2:]})
+        if not codes:
             return
         con = sqlite3.connect(DB, timeout=60)
-        con.execute("DELETE FROM points WHERE sid IN (SELECT sid FROM typhoons WHERE year=?)", (yr,))
-        con.execute("DELETE FROM typhoons WHERE year=?", (yr,))
+        done = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%' AND prov=0")}
+        todo = [c for c in codes if f"JMA{c}" not in done]
+        with ThreadPoolExecutor(4) as ex:
+            got = [g for g in ex.map(fetch_pdf, todo) if g[1]]
+        if got:  # IBTrACS由来の今年ぶんは気象庁の値で置き換える
+            con.execute("DELETE FROM points WHERE sid IN (SELECT sid FROM typhoons WHERE year=? AND sid NOT LIKE 'JMA%')", (yr,))
+            con.execute("DELETE FROM typhoons WHERE year=? AND sid NOT LIKE 'JMA%'", (yr,))
         for c, (y, no, en, pts, prov) in got:
+            con.execute("DELETE FROM points WHERE sid=?", (f"JMA{c}",))
             insert(con, f"JMA{c}", y, no, en, pts, int(prov))
-        con.execute("INSERT OR REPLACE INTO meta VALUES('jma_at',?)",
-                    (datetime.now(timezone.utc).strftime(F),))
-        con.commit(); con.close()
-        print(f"JMA {yr}: {len(got)} typhoons", flush=True)
+        con.execute("INSERT OR REPLACE INTO meta VALUES('jma_at',?)", (datetime.now(timezone.utc).strftime(F),))
+        con.commit()
+        print(f"JMA {yr}: {len(got)}/{len(todo)} fetched", flush=True)
     except Exception as e:  # 速報の取得に失敗しても既存データで動かす
         print("refresh_recent failed:", repr(e), flush=True)
+    finally:
+        if con: con.close()
 
 # ---------------- API ----------------
 @asynccontextmanager
@@ -194,6 +210,7 @@ async def lifespan(_):
     task.cancel()
 
 app = FastAPI(title="Typhoon DB", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 def q(sql, args=()):
     con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
@@ -342,8 +359,11 @@ const jst=(s,full)=>{const d=new Date(new Date(s.replace(" ","T")+"Z").getTime()
 const $=s=>document.querySelector(s), f=$("#f"), chips=document.querySelectorAll(".chip");
 const map=L.map("map",{worldCopyJump:true,zoomControl:false}).setView([25,135],4);
 L.control.zoom({position:"bottomright"}).addTo(map);
-L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",{attribution:"© OpenStreetMap © CARTO | 気象庁 / IBTrACS (NOAA)",maxZoom:8}).addTo(map);
-let layer=L.layerGroup().addTo(map);
+const ESRI="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/";
+L.tileLayer(ESRI+"World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",{attribution:"Tiles © Esri — Esri, DeLorme, NAVTEQ | 気象庁 / IBTrACS (NOAA)",maxZoom:12}).addTo(map);
+map.createPane("labels").style.zIndex=450;map.getPane("labels").style.pointerEvents="none";
+L.tileLayer(ESRI+"World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",{pane:"labels",maxZoom:12}).addTo(map);
+let layer=L.layerGroup().addTo(map), first=true;
 $("#legend").innerHTML=[...CLS,UNK].map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
 
 async function init(){
@@ -370,12 +390,17 @@ async function load(){
      <div class="t"><b>${r.title}${r.prov?"<em>速報</em>":""}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日</span>
      <div class="m"><i style="width:${Math.min(100,(r.max_wind||0)/1.3)}%;background:${col(r.max_wind)}"></i></div></div>
      <div class="v"><strong>${r.max_wind??"-"}</strong><small>kt</small><small>${r.min_pres??"-"}hPa</small></div></li>`).join("");
+    if(first){first=false;const s=location.hash.slice(1)||(rows[0]&&rows[0].sid);if(s)show(s)}  // 共有リンク or 最新の台風を自動表示
   }catch(e){$("#count").textContent="読み込みに失敗しました。再読み込みしてください"}
 }
 $("#list").addEventListener("click",e=>{const li=e.target.closest("li");if(li)show(li.dataset.sid,li)});
 async function show(sid,li){
-  document.querySelectorAll("#list li.on").forEach(x=>x.classList.remove("on"));li.classList.add("on");
-  const t=await (await fetch("/api/typhoons/"+sid)).json();
+  document.querySelectorAll("#list li.on").forEach(x=>x.classList.remove("on"));
+  li=li||document.querySelector(`#list li[data-sid="${sid}"]`);
+  if(li){li.classList.add("on");li.scrollIntoView({block:"nearest"})}
+  history.replaceState(null,"","#"+sid);
+  const r=await fetch("/api/typhoons/"+sid);if(!r.ok)return;
+  const t=await r.json();
   layer.clearLayers();
   const pts=t.track;
   // 日付変更線をまたぐ場合に備えて経度を連続化
