@@ -578,33 +578,52 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
 #rd{font-size:12px;color:var(--sub);margin-top:4px;font-variant-numeric:tabular-nums}
 #legend{left:14px;bottom:24px;padding:8px 12px;font-size:12px}
 #legend div{display:flex;gap:8px;align-items:center}#legend i{width:14px;height:4px;border-radius:2px;display:inline-block}
-#tog{display:none}
+html{overscroll-behavior:none}button{touch-action:manipulation}
+.st{display:none;flex-wrap:wrap;align-items:baseline;gap:2px 12px;margin-top:6px;font-size:13px}.st b{font-size:14px}
+.acts{display:none;grid-template-columns:1.2fr 1fr 1fr 1fr;gap:8px;margin-top:10px}
+.acts button{height:46px;border:0;border-radius:12px;background:var(--s2);font-weight:700;font-size:13px;cursor:pointer}
+.acts button:first-child{background:var(--acc);color:#04121f}.acts button:active{filter:brightness(1.25)}
+#fit{position:absolute;z-index:600;left:14px;top:14px;width:40px;height:40px;border:1px solid var(--line);border-radius:12px;background:rgba(16,26,48,.9);font-size:18px;cursor:pointer}
+#fab,#bd,.grab,#cl{display:none}
 #toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--s2);border:1px solid var(--line);padding:8px 16px;border-radius:99px;font-size:13px;z-index:2000;opacity:0;pointer-events:none;transition:opacity .2s}
 #toast.on{opacity:1}
 .leaflet-tooltip{background:var(--s1);color:var(--ink);border:1px solid var(--line);border-radius:8px}
 .leaflet-control-attribution{font-size:9px}
 @media(max-width:760px){
- body{grid-template-columns:1fr;grid-template-rows:var(--mh) 1fr;transition:grid-template-rows .25s}
- body.big{--mh:calc(100dvh - 190px)}
- aside{order:2;border:0;padding-bottom:env(safe-area-inset-bottom)}main{order:1}
- header{padding:10px 12px 6px;gap:8px}h1{font-size:17px}footer{display:none}
- .f input:not([type=checkbox]),.f select{font-size:16px;padding:11px 12px}  /* iOSの自動ズーム防止 */
+ body{display:block}
+ main{position:fixed;inset:0}
+ #bd{display:block;position:fixed;inset:0;z-index:1400;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .28s}
+ body.lst #bd{opacity:1;pointer-events:auto}
+ aside{position:fixed;left:0;right:0;bottom:0;height:86dvh;z-index:1500;border:0;border-top:1px solid var(--line);border-radius:20px 20px 0 0;box-shadow:0 -12px 40px #000a;transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1);padding-bottom:env(safe-area-inset-bottom);overscroll-behavior:contain}
+ body.lst aside{transform:none}
+ .grab{display:block;height:24px;position:relative;flex:none}.grab::before{content:"";position:absolute;left:50%;top:10px;width:44px;height:5px;margin-left:-22px;border-radius:3px;background:var(--line)}
+ #cl{display:block;flex:none;width:40px;height:40px;border:0;border-radius:12px;background:var(--s2);font-size:16px}
+ header{flex:none;max-height:52%;overflow:auto;padding:0 12px 8px;gap:10px;overscroll-behavior:contain}
+ h1{font-size:18px}.top .pill{margin-left:auto}footer{padding:10px 14px}
+ .f input:not([type=checkbox]),.f select{font-size:16px;padding:12px 14px;min-height:46px}  /* iOSの自動ズーム防止 */
  .chips{flex-wrap:nowrap;overflow-x:auto;margin:0 -12px;padding:0 12px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
- .chip{flex:none;padding:8px 14px;font-size:13px}#dir{min-width:48px}#reset{padding:11px}
- #count{padding:0 12px 6px}#list{padding:0 8px 12px}#list li{padding:12px}
- #info{left:10px;right:10px;top:auto;bottom:10px;width:auto;max-width:none;padding:10px 12px;padding-left:max(12px,env(safe-area-inset-left))}
- .hd h2{font-size:15px}.ib{width:38px;height:38px}
- .g{grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}.g div{padding:4px 8px}.g strong{font-size:14px}.g small{font-size:10px}
- #legend{left:10px;top:10px;bottom:auto;display:flex;gap:10px;padding:5px 10px;font-size:10px;max-width:calc(100% - 100px);overflow-x:auto}
+ .chip{flex:none;min-height:40px;padding:0 16px;font-size:14px}
+ #dir{min-width:52px}#reset{min-height:46px}summary{padding:10px 0;font-size:14px}
+ #count{padding:4px 14px 8px}
+ #list{padding:0 8px 16px;gap:4px}#list li{padding:14px 12px;min-height:64px}.t b{font-size:15px}
+ #info{left:0;right:0;bottom:0;top:auto;width:auto;max-width:none;border-radius:20px 20px 0 0;border-width:1px 0 0;padding:12px 14px calc(12px + env(safe-area-inset-bottom))}
+ .hd h2{font-size:17px}.hd .dk,.g{display:none}.st{display:flex}.acts{display:grid}
+ #play{width:44px;height:44px;font-size:16px}.pl{margin-top:8px}.chart svg{height:26px}#scrub{height:28px}
+ .leaflet-control-zoom,.leaflet-control-attribution{display:none}
+ #legend{left:10px;top:10px;bottom:auto;display:flex;gap:10px;padding:6px 10px;font-size:11px;max-width:calc(100% - 68px);overflow-x:auto;scrollbar-width:none}
  #legend div{flex:none;gap:4px}
- #tog{display:block;position:absolute;z-index:600;right:10px;top:10px;padding:8px 14px;background:var(--acc);color:#04121f;font-weight:700;border:0;border-radius:99px;font-size:13px}
- .leaflet-bottom.leaflet-right{margin-bottom:0}
+ #fit{left:auto;right:10px;top:10px;width:44px;height:44px}
+ #fab{display:block;position:absolute;z-index:600;left:50%;bottom:calc(16px + env(safe-area-inset-bottom));transform:translateX(-50%);padding:0 26px;height:48px;border:0;border-radius:99px;background:var(--acc);color:#04121f;font-weight:700;font-size:15px;box-shadow:0 6px 20px #0008}
+ #info:not([hidden])~#fab{display:none}
+ #toast{top:64px;bottom:auto}
 }
-@media(max-width:760px) and (max-height:520px){#info .g{display:none}}
+@media(max-width:760px) and (max-height:520px){.st,.chart svg{display:none}}
 </style></head><body>
+<div id="bd" onclick="closePanel()"></div>
 <aside>
+ <div class="grab" id="grab"></div>
  <header>
-  <div class="top"><h1>台風データベース</h1><span class="pill" id="st"></span></div>
+  <div class="top"><h1>台風データベース</h1><span class="pill" id="st"></span><button type="button" id="cl" aria-label="閉じる">✕</button></div>
   <form class="f" id="f" onsubmit="return false">
    <input class="wide" name="name" type="search" enterkeyhint="search" autocomplete="off" placeholder="名前・号数で検索（例: SURIGAE / 15号）">
    <div class="chips wide">
@@ -626,9 +645,9 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
    </div></details>
   </form></header>
  <div id="count"></div><ul id="list"></ul>
- <footer>出典: 気象庁（ベストトラック／位置表。IBTrACS経由）。風速は10分平均、時刻は日本時間。「速報」は速報値で後日修正されます。</footer>
+ <footer>出典: 気象庁（ベストトラック／位置表。IBTrACS経由）。風速は10分平均、時刻は日本時間。「速報」は速報値で後日修正されます。地図タイル: Esri。</footer>
 </aside>
-<main><div id="map"></div><button id="tog" type="button">地図を広げる</button><div id="info" class="card" hidden></div><div id="legend" class="card"></div></main>
+<main><div id="map"></div><button id="fit" type="button" aria-label="進路全体を表示">⌖</button><div id="info" class="card" hidden></div><button id="fab" type="button">☰ 台風一覧・検索</button><div id="legend" class="card"></div></main>
 <div id="toast"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -653,11 +672,22 @@ map.createPane("labels").style.zIndex=450;map.getPane("labels").style.pointerEve
 L.tileLayer(ESRI+"World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",{pane:"labels",maxZoom:12}).addTo(map);
 let layer=L.layerGroup().addTo(map), first=true, cur=null, playT=null;
 $("#legend").innerHTML=[...CLS,UNK].map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
-// 地図の拡大/縮小（スマホ）
-$("#tog").onclick=()=>{const b=document.body.classList.toggle("big");$("#tog").textContent=b?"一覧を見る":"地図を広げる";
-  setTimeout(()=>{map.invalidateSize();if(cur)map.fitBounds(cur.bounds,fitOpt())},300)};
+// 一覧パネル（スマホ: 下から出るシート）
+const openPanel=()=>{document.body.classList.add("lst");setTimeout(()=>{const l=$("#list li.on");l&&reveal(l)},60)};
+const closePanel=()=>document.body.classList.remove("lst");
+$("#cl").onclick=closePanel;$("#fab").onclick=openPanel;
+{let sy=null,dy=0;const a=$("aside");   // シートを下へスワイプして閉じる
+ for(const el of [$("#grab"),$(".top")]){
+  el.addEventListener("touchstart",e=>{sy=e.touches[0].clientY;dy=0;a.style.transition="none"},{passive:true});
+  el.addEventListener("touchmove",e=>{if(sy==null)return;dy=Math.max(0,e.touches[0].clientY-sy);a.style.transform=`translateY(${dy}px)`},{passive:true});
+  el.addEventListener("touchend",()=>{if(sy==null)return;sy=null;a.style.transition="";a.style.transform="";if(dy>80)closePanel()})}}
+f.name.addEventListener("keydown",e=>{if(e.key=="Enter")e.target.blur()});  // 検索確定でキーボードを閉じる
+function reveal(li){const L2=$("#list"),a=li.getBoundingClientRect(),b=L2.getBoundingClientRect();
+  if(a.top<b.top)L2.scrollTop-=b.top-a.top+8;else if(a.bottom>b.bottom)L2.scrollTop+=a.bottom-b.bottom+8}
+const barH=()=>mobile()&&!$("#info").hidden?$("#info").offsetHeight:0;
+const fitOpt=()=>mobile()?{paddingTopLeft:[16,54],paddingBottomRight:[16,barH()+16]}:{paddingTopLeft:[40,40],paddingBottomRight:[360,40]};
+$("#fit").onclick=()=>cur&&map.fitBounds(cur.bounds,fitOpt());
 addEventListener("resize",()=>map.invalidateSize());
-const fitOpt=()=>mobile()?{paddingTopLeft:[20,40],paddingBottomRight:[20,150]}:{padding:[40,40],paddingBottomRight:[360,40]};
 
 let jmaAt="";
 async function init(){
@@ -695,7 +725,7 @@ async function load(){
     if(first){first=false;const s=s0||(rows[0]&&rows[0].sid);if(s)show(s)}  // 共有リンク or 最新の台風を自動表示
   }catch(e){if(e.name!="AbortError"){$("#count").classList.remove("busy");$("#count").textContent="読み込みに失敗しました。再読み込みしてください"}}
 }
-$("#list").addEventListener("click",e=>{const li=e.target.closest("li");if(li)show(li.dataset.sid,li)});
+$("#list").addEventListener("click",e=>{const li=e.target.closest("li");if(li){if(mobile())closePanel();show(li.dataset.sid,li)}});
 function nav(d){const a=[...document.querySelectorAll("#list li")],i=a.findIndex(x=>x.classList.contains("on")),n=a[i+d];if(n)show(n.dataset.sid,n)}
 addEventListener("keydown",e=>{if(/INPUT|SELECT|TEXTAREA/.test(e.target.tagName))return;
   if(e.key=="ArrowDown"||e.key=="j"){e.preventDefault();nav(1)}else if(e.key=="ArrowUp"||e.key=="k"){e.preventDefault();nav(-1)}else if(e.key==" "&&cur){e.preventDefault();play()}});
@@ -703,7 +733,8 @@ addEventListener("keydown",e=>{if(/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)
 function setPos(i){if(!cur)return;cur.i=i;const p=cur.pts[i];cur.mk.setLatLng(cur.ll[i]);
   $("#scrub").value=i;$("#rd").textContent=`${jst(p.time,1)} ・ ${spd(p.wind)} ・ ${p.pres??"-"}hPa`;
   const c=$("#cur");if(c){c.setAttribute("x1",cur.xs[i]);c.setAttribute("x2",cur.xs[i])}
-  if(!map.getBounds().pad(-.1).contains(cur.ll[i]))map.panTo(cur.ll[i])}
+  const pt=map.latLngToContainerPoint(cur.ll[i]),s=map.getSize(),bh=barH(),rx=mobile()?0:350,top=mobile()?50:20;
+  if(pt.x<24||pt.x>s.x-rx-24||pt.y<top||pt.y>s.y-bh-24)map.panBy([pt.x-(s.x-rx)/2,pt.y-(top+(s.y-bh-top)/2)])}
 function stop(){clearInterval(playT);playT=null;const b=$("#play");if(b)b.textContent="▶"}
 function play(){if(!cur)return;if(playT)return stop();$("#play").textContent="❚❚";if(cur.i>=cur.pts.length-1)setPos(0);
   playT=setInterval(()=>{if(cur.i>=cur.pts.length-1)return stop();setPos(cur.i+1)},Math.max(60,Math.min(250,6000/cur.pts.length)))}
@@ -714,7 +745,7 @@ async function show(sid,li,keep){
   const my=++seq;stop();
   document.querySelectorAll("#list li.on").forEach(x=>x.classList.remove("on"));
   li=li||document.querySelector(`#list li[data-sid="${CSS.escape(sid)}"]`);
-  if(li){li.classList.add("on");if(!keep)li.scrollIntoView({block:"nearest"})}
+  if(li){li.classList.add("on");if(!keep)reveal(li)}
   history.replaceState(null,"","#"+sid);
   const r=await fetch("/api/typhoons/"+encodeURIComponent(sid));if(!r.ok||my!=seq)return;
   const t=await r.json();if(my!=seq)return;
@@ -724,28 +755,31 @@ async function show(sid,li,keep){
   let prev=null;const ll=pts.map(p=>{let lo=p.lon;if(prev!==null){while(lo-prev>180)lo-=360;while(lo-prev<-180)lo+=360}prev=lo;return [p.lat,lo]});
   L.polyline(ll,{color:"#fff",weight:9,opacity:.08}).addTo(layer);
   for(let i=1;i<pts.length;i++) L.polyline([ll[i-1],ll[i]],{color:col(pts[i].wind),weight:4,lineCap:"round"}).addTo(layer);
-  pts.forEach((p,i)=>L.circleMarker(ll[i],{radius:i==0||i==pts.length-1?6:3,color:"#fff",weight:1,fillColor:col(p.wind),fillOpacity:1})
-    .bindTooltip(`${i==0?"発生 ":i==pts.length-1?"終了 ":""}${jst(p.time,1)}<br>${spd(p.wind)} / ${p.pres??"-"}hPa`).addTo(layer));
+  pts.forEach((p,i)=>{const e=i==0||i==pts.length-1;
+    L.circleMarker(ll[i],{radius:e?6:3,color:"#fff",weight:1,fillColor:col(p.wind),fillOpacity:1,interactive:false}).addTo(layer);
+    L.circleMarker(ll[i],{radius:14,stroke:false,fillOpacity:0,bubblingMouseEvents:false}).on("click",()=>{stop();setPos(i)})
+     .bindTooltip(`${i==0?"発生 ":e?"終了 ":""}${jst(p.time,1)}<br>${spd(p.wind)} / ${p.pres??"-"}hPa`).addTo(layer)});
   const n=pts.length,W=300,xs=pts.map((_,i)=>n>1?i/(n-1)*W:0),mw=Math.max(1,...pts.map(p=>p.wind||0));
   const wl=pts.map((p,i)=>p.wind==null?null:`${xs[i].toFixed(1)},${(38-p.wind/mw*34).toFixed(1)}`).filter(Boolean).join(" ");
   const dist=Math.round(ll.slice(1).reduce((s,p,i)=>s+km(ll[i],p),0)/10)*10;
   cur={pts,ll,xs,i:0,bounds:L.latLngBounds(ll),mk:L.circleMarker(ll[0],{radius:9,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:.9,interactive:false}).addTo(layer)};
-  if(!keep)map.fitBounds(cur.bounds,fitOpt());
   const i=$("#info");i.hidden=false;
   i.innerHTML=`<div class="hd"><h2>${esc(t.title)}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2>
-    <button class="ib" onclick="nav(-1)" aria-label="前の台風">◀</button><button class="ib" onclick="nav(1)" aria-label="次の台風">▶</button>
-    <button class="ib" onclick="share()" aria-label="共有">⤴</button><button class="ib" onclick="$('#info').hidden=true;stop()" aria-label="閉じる">✕</button></div>
+    <button class="ib dk" onclick="nav(-1)" aria-label="前の台風">◀</button><button class="ib dk" onclick="nav(1)" aria-label="次の台風">▶</button>
+    <button class="ib dk" onclick="share()" aria-label="共有">⤴</button><button class="ib dk" onclick="$('#info').hidden=true;stop()" aria-label="閉じる">✕</button></div>
    <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）${dist?` ・ 約${dist.toLocaleString()}km`:""}</div>
    <div class="g"><div><small>最大風速</small><strong>${t.max_wind??"-"}<span> m/s</span></strong></div>
    <div><small>強さ</small><strong style="color:${col(t.max_wind)}">${cls(t.max_wind)}</strong></div>
    <div><small>最低気圧</small><strong>${t.min_pres??"-"}<span> hPa</span></strong></div>
    <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div></div>
-   <div class="pl"><button class="ib" id="play" onclick="play()" aria-label="再生">▶</button><div class="chart">
+   <div class="st"><b style="color:${col(t.max_wind)}">${cls(t.max_wind)}</b><span>最大 ${spd(t.max_wind)}</span><span>${t.min_pres??"-"}hPa</span><span>${t.days}日</span></div>
+   <div class="pl"><button class="ib" id="play" onclick="play()" aria-label="再生">▶</button><div class="chart"><div id="rd"></div>
     <svg viewBox="0 0 ${W} 40" preserveAspectRatio="none"><polyline points="${wl}" fill="none" stroke="${col(t.max_wind)}" stroke-width="2" vector-effect="non-scaling-stroke"/>
     <line id="cur" x1="0" x2="0" y1="0" y2="40" stroke="#fff" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
     <input id="scrub" type="range" min="0" max="${Math.max(0,n-1)}" value="0" aria-label="時刻"></div></div>
-   <div id="rd"></div>`;
+   <div class="acts"><button type="button" onclick="openPanel()">☰ 一覧</button><button type="button" onclick="nav(-1)">◀ 前</button><button type="button" onclick="nav(1)">次 ▶</button><button type="button" onclick="share()">⤴ 共有</button></div>`;
   $("#scrub").oninput=e=>{stop();setPos(+e.target.value)};
+  if(!keep)map.fitBounds(cur.bounds,fitOpt());
   setPos(0);
 }
 init();
