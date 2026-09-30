@@ -441,6 +441,68 @@ def diag():
         print(r)
     con.close()
 
+# ---------------- 予報モデル比較：取得元の診断 ----------------
+RAL = "https://hurricanes.ral.ucar.edu/realtime"  # UCAR RAL TCGP：台風ごとの ATCF a-deck（各機関の予報進路）を公開
+# a-deck の技術ID → モデル名の「推定」。実データでの確認前なので、fdiag の出力を見て本実装で確定する
+GUESS = {"JTWC": "JTWC公式", "AVNO": "GFS", "AVNI": "GFS(補間)", "GFSO": "GFS", "EMX": "ECMWF", "EMXI": "ECMWF(補間)",
+         "ECMF": "ECMWF", "UKM": "UKMET", "UKMI": "UKMET(補間)", "UKX": "UKMET", "UKXI": "UKMET(補間)",
+         "JGSM": "JMA-GSM", "JGSI": "JMA-GSM(補間)", "NVGM": "NAVGEM", "NGX": "NAVGEM", "CTCX": "COAMPS-TC",
+         "HWRF": "HWRF", "HAFS": "HAFS", "BEST": "ベストトラック"}
+
+def parse_adeck(text):
+    """ATCF a-deck → [(初期時刻yyyymmddhh, 技術ID, 予報時間tau[h], 緯度, 経度, 風速kt, 気圧hPa)]。壊れた行は捨てる。"""
+    out = []
+    for ln in text.splitlines():
+        c = [x.strip() for x in ln.split(",")]
+        if len(c) < 10 or not c[2].isdigit() or not c[5].lstrip("-").isdigit():
+            continue
+        try:
+            la = int(c[6][:-1]) / 10 * (-1 if c[6][-1] == "S" else 1)
+            lo = int(c[7][:-1]) / 10 * (-1 if c[7][-1] == "W" else 1)
+        except (ValueError, IndexError):
+            continue
+        v, p = (int(x) if x.lstrip("-").isdigit() and int(x) > 0 else None for x in (c[8], c[9]))
+        out.append((c[2], c[4], int(c[5]), la, lo, v, p))
+    return out
+
+def fdiag(P=print, storms=None):
+    """python app.py fdiag : 予報比較の取得元を確認する（JMA予報円・a-deckに載っているモデルID・更新時刻）。
+    環境変数 FDIAG_STORMS="wp25,wp26"（または /api/fdiag?storms=wp25）で対象を指定できる（未指定なら UCAR の「現在の活動中」ページから自動検出）。"""
+    P("== JMA 予報（防災情報JSON forecast.json）")
+    for t in get_json(f"{BOSAI}/targetTc.json", []):
+        tc = t.get("tropicalCyclone")
+        fc = get_json(f"{BOSAI}/{tc}/forecast.json", [])
+        pts = [(r.get("advancedHours"), r.get("center")) for r in fc if isinstance(r, dict) and r.get("advancedHours") is not None]
+        P(tc, t.get("typhoonNumber"), t.get("category"), f"予報{len(pts)}点", pts[:8])
+    P("== UCAR RAL a-deck")
+    yr = datetime.now(timezone.utc).year
+    ids = [x.strip().lower() for x in (storms or os.environ.get("FDIAG_STORMS", "")).split(",") if x.strip()]
+    if not ids:
+        try:
+            html = requests.get(f"{RAL}/current/", headers=UA, timeout=30).text
+            ids = sorted(set(re.findall(r"northwestpacific/\d{4}/(wp\d{2})\d{4}/", html)))
+        except Exception as e:
+            P("活動中ページの取得に失敗:", repr(e))
+    P("対象:", ids or "なし（FDIAG_STORMS=wp25 のように指定できます）")
+    for sid in ids:
+        url = f"{RAL}/plots/northwestpacific/{yr}/{sid}{yr}/a{sid}{yr}.dat"
+        try:
+            r = requests.get(url, headers=UA, timeout=60)
+        except Exception as e:
+            P(sid, "取得失敗", repr(e)); continue
+        P(f"\n{sid}: HTTP {r.status_code}  Last-Modified: {r.headers.get('Last-Modified', '-')}  {len(r.content)//1024}KB\n  {url}")
+        rows = parse_adeck(r.text) if r.ok else []
+        if not rows:
+            P("  パースできる行なし"); continue
+        latest = max(x[0] for x in rows)
+        P(f"  最新の初期時刻: {latest} UTC ／ 行数 {len(rows)} ／ 初期時刻の種類 {len({x[0] for x in rows})}")
+        P("  技術ID  推定モデル      初期時刻数  最新初期時刻  最新の点数  最大tau  +72h位置")
+        for tech in sorted({x[1] for x in rows}):
+            mine = [x for x in rows if x[1] == tech]
+            li = max(x[0] for x in mine); cur = [x for x in mine if x[0] == li]
+            p72 = next(((x[3], x[4]) for x in cur if x[2] == 72), None)
+            P(f"  {tech:<7} {GUESS.get(tech, '?'):<14} {len({x[0] for x in mine}):>8}  {li:>12}  {len(cur):>8}  {max(x[2] for x in cur):>6}  {p72 or '-'}")
+
 # ---------------- API ----------------
 @asynccontextmanager
 async def lifespan(_):
@@ -469,6 +531,19 @@ def q(sql, args=()):
 @app.get("/", response_class=HTMLResponse)
 def index():
     return PAGE
+
+_fd = {"t": 0, "k": None, "txt": ""}
+@app.get("/api/fdiag")
+def api_fdiag(storms: str = ""):
+    """予報比較の取得元診断をブラウザで見る用（Renderの無料プランはShellが使えないため）。5分間は結果を使い回す。"""
+    from fastapi.responses import PlainTextResponse
+    import time
+    if _fd["k"] != storms or time.time() - _fd["t"] > 300:
+        out = []
+        try: fdiag(lambda *a: out.append(" ".join(str(x) for x in a)), storms)
+        except Exception as e: out.append(f"エラー: {e!r}")
+        _fd.update(t=time.time(), k=storms, txt="\n".join(out))
+    return PlainTextResponse(_fd["txt"])
 
 @app.get("/api/years")
 def years():
@@ -709,8 +784,8 @@ dialog::backdrop{background:#000b}dialog h2{margin:0;font-size:17px}dialog h3{ma
     <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="name">名前順</option></select>
     <button type="button" id="dir" title="昇順・降順">↓</button><input type="hidden" name="order" value="desc"></div>
-   <div class="chips wide"><button type="button" class="chip t" id="tNear">現在地から</button><button type="button" class="chip t" id="tPick">地図で指定</button>
-    <button type="button" class="chip t" id="tAll">重ねて表示</button><button type="button" class="chip t" id="tStat">統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
+   <div class="chips wide"><button type="button" class="chip t" id="tNear">📍 現在地から</button><button type="button" class="chip t" id="tPick">📌 地図で指定</button>
+    <button type="button" class="chip t" id="tAll">🗺 重ねて表示</button><button type="button" class="chip t" id="tStat">📊 統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
    <details><summary>詳細条件</summary><div class="f2">
     <label>年（から）<select name="year_from"><option value="">指定なし</option></select></label>
     <label>年（まで）<select name="year_to"><option value="">指定なし</option></select></label>
@@ -928,6 +1003,8 @@ if __name__ == "__main__":
         build()
     elif len(sys.argv) > 1 and sys.argv[1] == "diag":
         diag()
+    elif len(sys.argv) > 1 and sys.argv[1] == "fdiag":
+        fdiag()
     else:
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
