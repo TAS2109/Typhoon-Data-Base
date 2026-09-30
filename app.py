@@ -481,11 +481,15 @@ SORTS = {"number": "year {d}, number {d}", "date": "start_time {d}",
          "wind": "max_wind IS NULL, max_wind {d}", "pres": "min_pres IS NULL, min_pres {d}",
          "days": "days {d}", "name": "name_en = '', name_en {d}"}
 
-@app.get("/api/typhoons")
-def typhoons(name: str | None = None, year_from: int | None = None, year_to: int | None = None,
-             month: int | None = None, wind_min: float | None = None, wind_max: float | None = None,
-             pres_max: float | None = None, days_min: float | None = None, named: bool = False,
-             sort: str = "number", order: str = "desc", limit: int = Query(300, le=1000)):
+import math, json
+from fastapi import Depends
+from fastapi.responses import Response, JSONResponse
+
+def flt(name: str | None = None, year_from: int | None = None, year_to: int | None = None,
+        month: int | None = None, wind_min: float | None = None, wind_max: float | None = None,
+        pres_max: float | None = None, days_min: float | None = None, named: bool = False,
+        near: str | None = None):
+    """絞り込み条件（一覧・重ね表示・統計で共通）→ (WHERE句, 引数)。near は 'lat,lon,km'"""
     where, args = [], []
     def add(c, v): where.append(c); args.append(v)
     if name and name.strip():
@@ -499,12 +503,80 @@ def typhoons(name: str | None = None, year_from: int | None = None, year_to: int
     if pres_max is not None: add("min_pres<=?", pres_max)
     if days_min is not None: add("days>=?", days_min)
     if named: where.append("name_en<>''")
-    w = ("WHERE " + " AND ".join(where)) if where else ""
+    if near:
+        try: la, lo, km = (float(x) for x in near.split(","))
+        except ValueError: raise HTTPException(422, "near は lat,lon,km の形式で指定してください")
+        dla, dlo = km / 111.0, km / (111.0 * max(0.05, math.cos(math.radians(la))))
+        ids = set()
+        for sh in (0, 360, -360):  # 経度が -180..180 でも 0..360 でも拾えるように
+            for r in q("SELECT sid, lat, lon FROM points WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?",
+                       (la - dla, la + dla, lo + sh - dlo, lo + sh + dlo)):
+                if r["sid"] in ids: continue
+                p1, p2, d = math.radians(r["lat"]), math.radians(la), math.radians((r["lon"] - lo + 540) % 360 - 180)
+                c = math.sin(p1) * math.sin(p2) + math.cos(p1) * math.cos(p2) * math.cos(d)
+                if 6371 * math.acos(max(-1.0, min(1.0, c))) <= km: ids.add(r["sid"])
+        where.append("sid IN (SELECT value FROM json_each(?))"); args.append(json.dumps(sorted(ids)))
+    return (("WHERE " + " AND ".join(where)) if where else ""), args
+
+@app.get("/api/typhoons")
+def typhoons(fl=Depends(flt), sort: str = "number", order: str = "desc", limit: int = Query(300, le=1000)):
+    w, args = fl
     ob = SORTS.get(sort, SORTS["number"]).format(d="ASC" if order == "asc" else "DESC")
     total = q(f"SELECT COUNT(*) AS n FROM typhoons {w}", args)[0]["n"]
     rows = q(f"SELECT * FROM typhoons {w} ORDER BY {ob} LIMIT ?", (*args, limit))
     for r in rows: r["max_wind"] = to_ms(r["max_wind"])
     return {"total": total, "rows": rows}
+
+@app.get("/api/tracks")
+def tracks(fl=Depends(flt), limit: int = Query(300, le=600)):
+    """条件に合う台風の進路をまとめて返す（地図への重ね表示用。点は間引く）"""
+    w, args = fl
+    sub = f"SELECT sid, title, max_wind FROM typhoons {w} ORDER BY year DESC, number DESC LIMIT ?"
+    ts = {r["sid"]: {"sid": r["sid"], "title": r["title"], "w": to_ms(r["max_wind"]), "p": []} for r in q(sub, (*args, limit))}
+    for r in q(f"SELECT sid, lat, lon FROM points WHERE sid IN (SELECT sid FROM ({sub})) ORDER BY sid, time", (*args, limit)):
+        ts[r["sid"]]["p"].append([round(r["lat"], 2), round(r["lon"], 2)])
+    for t in ts.values(): t["p"] = t["p"][::2] + ([t["p"][-1]] if len(t["p"]) % 2 == 0 else [])
+    return list(ts.values())
+
+@app.get("/api/stats")
+def stats(fl=Depends(flt)):
+    w, args = fl
+    rows = q(f"SELECT year, month, max_wind, days, title FROM typhoons {w}", args)
+    yrs, mon, cls = {}, [0] * 12, {}
+    for r in rows:
+        yrs[r["year"]] = yrs.get(r["year"], 0) + 1
+        if r["month"] and 1 <= r["month"] <= 12: mon[r["month"] - 1] += 1
+        v = to_ms(r["max_wind"])
+        k = "不明" if v is None else next(n for t, n in ((54, "猛烈な"), (44, "非常に強い"), (33, "強い"), (17, "台風"), (0, "熱帯低気圧")) if v >= t)
+        cls[k] = cls.get(k, 0) + 1
+    ds = [r for r in rows if r["days"] is not None]
+    mx = max(ds, key=lambda r: r["days"], default=None)
+    return {"total": len(rows), "months": mon, "classes": cls,
+            "years": [[y, yrs.get(y, 0)] for y in range(min(yrs), max(yrs) + 1)] if yrs else [],
+            "avg_days": round(sum(r["days"] for r in ds) / len(ds), 1) if ds else None,
+            "max_row": {"title": mx["title"], "days": mx["days"]} if mx else None}
+
+# ---- PWA（ホーム画面に追加・オフライン時は直近のデータを表示）----
+ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#0a1120"/>'
+        '<g fill="none" stroke="#38bdf8" stroke-linecap="round" stroke-width="32"><circle cx="256" cy="256" r="26" fill="#38bdf8"/>'
+        '<path d="M256 170a86 86 0 0 1 86 86M256 342a86 86 0 0 1-86-86M256 110a146 146 0 0 1 146 146M256 402a146 146 0 0 1-146-146" opacity=".85"/></g></svg>')
+SW = r"""const V="tf-v1";
+self.addEventListener("install",e=>{e.waitUntil(caches.open(V).then(c=>c.addAll(["/"])));self.skipWaiting()});
+self.addEventListener("activate",e=>e.waitUntil(caches.keys().then(k=>Promise.all(k.filter(x=>x!=V).map(x=>caches.delete(x)))).then(()=>clients.claim())));
+self.addEventListener("fetch",e=>{const r=e.request,u=new URL(r.url);
+  if(r.method!="GET"||/arcgisonline/.test(u.host))return;  // 地図タイルはキャッシュしない
+  e.respondWith(fetch(r).then(x=>{if(x.ok||x.type=="opaque"){const c=x.clone();caches.open(V).then(k=>k.put(r,c))}return x}).catch(()=>caches.match(r)))});
+"""
+@app.get("/manifest.webmanifest")
+def manifest():
+    return JSONResponse({"name": "台風データベース", "short_name": "台風DB", "start_url": "/", "display": "standalone",
+                         "background_color": "#0a1120", "theme_color": "#0a1120",
+                         "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]},
+                        media_type="application/manifest+json")
+@app.get("/icon.svg")
+def icon(): return Response(ICON, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+@app.get("/sw.js")
+def sw(): return Response(SW, media_type="application/javascript", headers={"Cache-Control": "no-cache"})
 
 @app.get("/api/typhoons/{sid}")
 def detail(sid: str):
@@ -519,6 +591,7 @@ PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#0a1120">
+<link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg"><link rel="apple-touch-icon" href="/icon.svg">
 <title>台風データベース</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Zen+Kaku+Gothic+New:wght@400;700;900&display=swap" rel="stylesheet">
@@ -578,7 +651,12 @@ main{position:relative;min-height:0}#map{height:100%;background:#0b1522}
 #rd{font-size:12px;color:var(--sub);margin-top:4px;font-variant-numeric:tabular-nums}
 #legend{left:14px;bottom:24px;padding:8px 12px;font-size:12px}
 #legend div{display:flex;gap:8px;align-items:center}#legend i{width:14px;height:4px;border-radius:2px;display:inline-block}
-html{overscroll-behavior:none}button{touch-action:manipulation}
+html{overscroll-behavior:none}#reset{grid-column:span 2}
+dialog{background:var(--s1);color:var(--ink);border:1px solid var(--line);border-radius:18px;width:min(560px,94vw);max-height:86dvh;padding:16px;overflow:auto}
+dialog::backdrop{background:#000b}dialog h2{margin:0;font-size:17px}dialog h3{margin:14px 0 6px;font-size:13px;color:var(--sub)}
+.bs{width:100%;height:90px;display:block;background:var(--s2);border-radius:10px}.ax{display:flex;justify-content:space-between;color:var(--sub);font-size:11px;margin-top:2px}
+.cb{display:flex;height:14px;border-radius:7px;overflow:hidden;background:var(--s2)}.cb i{display:block}
+.lg{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;font-size:12px}.lg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px}button{touch-action:manipulation}
 .st{display:none;flex-wrap:wrap;align-items:baseline;gap:2px 12px;margin-top:6px;font-size:13px}.st b{font-size:14px}
 .acts{display:none;grid-template-columns:1.2fr 1fr 1fr 1fr;gap:8px;margin-top:10px}
 .acts button{height:46px;border:0;border-radius:12px;background:var(--s2);font-weight:700;font-size:13px;cursor:pointer}
@@ -631,11 +709,14 @@ html{overscroll-behavior:none}button{touch-action:manipulation}
     <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="name">名前順</option></select>
     <button type="button" id="dir" title="昇順・降順">↓</button><input type="hidden" name="order" value="desc"></div>
+   <div class="chips wide"><button type="button" class="chip t" id="tNear">📍 現在地から</button><button type="button" class="chip t" id="tPick">📌 地図で指定</button>
+    <button type="button" class="chip t" id="tAll">🗺 重ねて表示</button><button type="button" class="chip t" id="tStat">📊 統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
    <details><summary>詳細条件</summary><div class="f2">
     <label>年（から）<select name="year_from"><option value="">指定なし</option></select></label>
     <label>年（まで）<select name="year_to"><option value="">指定なし</option></select></label>
     <label>発生月<select name="month"><option value="">全て</option></select></label>
     <label>表示件数<select name="limit"><option>100</option><option selected>300</option><option>1000</option></select></label>
+    <label>近くを通った範囲<select name="km"><option value="100">100km以内</option><option value="300" selected>300km以内</option><option value="500">500km以内</option><option value="1000">1000km以内</option></select></label>
     <label>最大風速 m/s 以上<input type="number" inputmode="numeric" name="wind_min" min="0"></label>
     <label>最大風速 m/s 以下<input type="number" inputmode="numeric" name="wind_max" min="0"></label>
     <label>最低気圧 hPa 以下<input type="number" inputmode="numeric" name="pres_max" placeholder="例: 930"></label>
@@ -648,6 +729,7 @@ html{overscroll-behavior:none}button{touch-action:manipulation}
  <footer>出典: 気象庁（ベストトラック／位置表。IBTrACS経由）。風速は10分平均、時刻は日本時間。「速報」は速報値で後日修正されます。地図タイル: Esri。</footer>
 </aside>
 <main><div id="map"></div><button id="fit" type="button" aria-label="進路全体を表示">⌖</button><div id="info" class="card" hidden></div><button id="fab" type="button">☰ 台風一覧・検索</button><div id="legend" class="card"></div></main>
+<dialog id="dlg"></dialog>
 <div id="toast"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
@@ -658,7 +740,7 @@ const spd=w=>w==null?"-":`${w}m/s`;
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const jst=(s,full)=>{const d=new Date(new Date(s.replace(" ","T")+"Z").getTime()+9*3600e3),z=n=>String(n).padStart(2,"0");
   return `${full?d.getUTCFullYear()+"/":""}${d.getUTCMonth()+1}/${d.getUTCDate()} ${z(d.getUTCHours())}時`};
-const $=s=>document.querySelector(s), f=$("#f"), chips=document.querySelectorAll(".chip");
+const $=s=>document.querySelector(s), f=$("#f"), chips=document.querySelectorAll(".chip[data-w]");
 const mobile=()=>matchMedia("(max-width:760px)").matches;
 const store={get(){try{return JSON.parse(localStorage.getItem("tf")||"{}")}catch(e){return{}}},set(v){try{localStorage.setItem("tf",JSON.stringify(v))}catch(e){}}};
 function toast(m){const t=$("#toast");t.textContent=m;t.classList.add("on");clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove("on"),1800)}
@@ -697,7 +779,7 @@ async function init(){
   const sv=store.get();for(const k in sv) if(f[k]&&f[k].type!="checkbox") f[k].value=sv[k];  // 前回の絞り込みを復元
   f.named.checked=sv.named==="true";
   jmaAt=y.jma_at||"";if(jmaAt) $("#st").innerHTML=`速報 <b>${jst(jmaAt)}</b> 更新`;
-  $("#reset").onclick=()=>{f.reset();f.order.value="desc";load()};
+  $("#reset").onclick=()=>{f.reset();f.order.value="desc";near=null;load()};
   $("#dir").onclick=()=>{f.order.value=f.order.value=="desc"?"asc":"desc";load()};
   chips.forEach(c=>c.onclick=()=>{f.wind_min.value=c.dataset.w;f.wind_max.value="";load()});
   f.addEventListener("input",e=>{if(e.isComposing)return;clearTimeout(init.t);init.t=setTimeout(load,250)});
@@ -710,6 +792,8 @@ async function load(){
   for(const k of ["name","year_from","year_to","month","wind_min","wind_max","pres_max","days_min","sort","order","limit"]) if(f[k].value) p.set(k,f[k].value);
   if(f.named.checked) p.set("named","true");
   store.set(Object.fromEntries(p));
+  if(near)p.set("near",`${near[0]},${near[1]},${f.km.value}`);
+  lastP=p;drawNear();if(ovOn)drawOverlay(p);
   chips.forEach(c=>c.classList.toggle("on",c.dataset.w===f.wind_min.value&&!f.wind_max.value));
   $("#dir").textContent=f.order.value=="desc"?"↓":"↑";
   ctl&&ctl.abort();ctl=new AbortController();$("#count").classList.add("busy");  // 古いリクエストを破棄
@@ -782,6 +866,47 @@ async function show(sid,li,keep){
   if(!keep)map.fitBounds(cur.bounds,fitOpt());
   setPos(0);
 }
+// ---- 現在地・指定地点の近くを通った台風 / 重ね表示 / 統計 / CSV / PWA ----
+let near=null,pick=false,ovOn=false,lastP=new URLSearchParams();
+map.createPane("ov").style.zIndex=380;
+const nearL=L.layerGroup().addTo(map),ovL=L.layerGroup().addTo(map);
+function drawNear(){nearL.clearLayers();$("#tNear").classList.toggle("on",!!near);
+  if(near){L.circle(near,{radius:f.km.value*1000,color:"#38bdf8",weight:1,fillOpacity:.07,interactive:false}).addTo(nearL);
+    L.circleMarker(near,{radius:5,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:1,interactive:false}).addTo(nearL)}}
+function setNear(la,lo){near=la==null?null:[+la.toFixed(3),+lo.toFixed(3)];load();
+  if(near)map.fitBounds(L.circle(near,{radius:f.km.value*1000}).getBounds(),fitOpt())}
+$("#tNear").onclick=()=>{if(near)return setNear(null);
+  if(!navigator.geolocation)return toast("位置情報を使えません");toast("現在地を取得中…");
+  navigator.geolocation.getCurrentPosition(p=>setNear(p.coords.latitude,p.coords.longitude),()=>toast("現在地を取得できません。「地図で指定」をお試しください"),{timeout:10000})};
+$("#tPick").onclick=()=>{pick=true;toast("地図をタップして地点を指定");if(mobile())closePanel()};
+map.on("click",e=>{if(!pick)return;pick=false;const l=e.latlng.wrap();setNear(l.lat,l.lng);if(mobile())openPanel()});
+async function drawOverlay(p){const q=new URLSearchParams(p);["limit","sort","order"].forEach(k=>q.delete(k));
+  try{const r=await (await fetch("/api/tracks?"+q)).json();ovL.clearLayers();
+    r.forEach(t=>{let pv=null;const ll=t.p.map(([la,lo])=>{if(pv!==null){while(lo-pv>180)lo-=360;while(lo-pv<-180)lo+=360}pv=lo;return [la,lo]});
+      L.polyline(ll,{pane:"ov",color:col(t.w),weight:2,opacity:.5}).bindTooltip(esc(t.title)).on("click",()=>{if(mobile())closePanel();show(t.sid)}).addTo(ovL)});
+    return r.length}catch(e){}}
+$("#tAll").onclick=async()=>{ovOn=!ovOn;$("#tAll").classList.toggle("on",ovOn);
+  if(!ovOn){ovL.clearLayers();return}
+  const n=await drawOverlay(lastP);toast(n?`${n}本を重ねて表示（タップで選択）`:"該当なし");if(n&&mobile())closePanel()};
+$("#tStat").onclick=async()=>{const q=new URLSearchParams(lastP);["limit","sort","order"].forEach(k=>q.delete(k));
+  const d=$("#dlg");d.innerHTML="<p>集計中…</p>";d.showModal();
+  try{const s=await (await fetch("/api/stats?"+q)).json(),tot=s.total||1,ys=s.years;
+    const cl=[...CLS,UNK].map(c=>[c[1],s.classes[c[1]]||0,c[2]]).filter(c=>c[1]);
+    const bars=(a,c)=>{const mx=Math.max(1,...a.map(x=>x[1])),w=100/a.length;
+      return `<svg class="bs" viewBox="0 0 100 40" preserveAspectRatio="none">${a.map((x,i)=>`<rect x="${(i*w+.15).toFixed(2)}" y="${(38-x[1]/mx*36).toFixed(2)}" width="${(w-.3).toFixed(2)}" height="${(x[1]/mx*36).toFixed(2)}" fill="${c}"><title>${x[0]}: ${x[1]}</title></rect>`).join("")}</svg>`};
+    d.innerHTML=`<div class="hd"><h2>統計（現在の絞り込み）</h2><button class="ib" onclick="$('#dlg').close()" aria-label="閉じる">✕</button></div>
+     <div class="sub" style="color:var(--sub);font-size:12px;margin-top:4px">${s.total}個 ／ 平均継続 ${s.avg_days??"-"}日${s.max_row?` ／ 最長 ${esc(s.max_row.title)}（${s.max_row.days}日）`:""}</div>
+     <h3>強さ別</h3><div class="cb">${cl.map(c=>`<i style="width:${c[1]/tot*100}%;background:${c[2]}"></i>`).join("")}</div>
+     <div class="lg">${cl.map(c=>`<span><i style="background:${c[2]}"></i>${c[0]} ${c[1]}</span>`).join("")}</div>
+     <h3>月別の発生数</h3>${bars(s.months.map((n,i)=>[(i+1)+"月",n]),"#38bdf8")}<div class="ax"><span>1月</span><span>6月</span><span>12月</span></div>
+     ${ys.length>1?`<h3>年別の発生数</h3>${bars(ys,"#ff8a3d")}<div class="ax"><span>${ys[0][0]}</span><span>${ys[ys.length-1][0]}</span></div>`:""}`;
+  }catch(e){d.innerHTML="<p>集計に失敗しました</p>"}};
+$("#dlg").addEventListener("click",e=>{if(e.target.id=="dlg")e.target.close()});
+$("#tCsv").onclick=()=>{if(!cur)return toast("台風を選択してください");
+  const nm=($("#info h2").firstChild.textContent||"typhoon").replace(/[\\/:*?"<>|\s]+/g,"_");
+  const rows=["time_utc,lat,lon,wind_ms,pres_hpa",...cur.pts.map(p=>[p.time,p.lat,p.lon,p.wind??"",p.pres??""].join(","))];
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+rows.join("\n")],{type:"text/csv"}));a.download=nm+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1e3)};
+if("serviceWorker" in navigator)addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>{}));
 init();
 // 開いたままでも、サーバー側で速報が更新されたら一覧と表示中の台風を自動で更新する
 async function poll(){
