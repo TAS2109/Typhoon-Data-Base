@@ -709,8 +709,8 @@ dialog::backdrop{background:#000b}dialog h2{margin:0;font-size:17px}dialog h3{ma
     <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="name">名前順</option></select>
     <button type="button" id="dir" title="昇順・降順">↓</button><input type="hidden" name="order" value="desc"></div>
-   <div class="chips wide"><button type="button" class="chip t" id="tNear">📍 現在地から</button><button type="button" class="chip t" id="tPick">📌 地図で指定</button>
-    <button type="button" class="chip t" id="tAll">🗺 重ねて表示</button><button type="button" class="chip t" id="tStat">📊 統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
+   <div class="chips wide"><button type="button" class="chip t" id="tNear">現在地から</button><button type="button" class="chip t" id="tPick">地図で指定</button>
+    <button type="button" class="chip t" id="tAll">重ねて表示</button><button type="button" class="chip t" id="tStat">統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
    <details><summary>詳細条件</summary><div class="f2">
     <label>年（から）<select name="year_from"><option value="">指定なし</option></select></label>
     <label>年（まで）<select name="year_to"><option value="">指定なし</option></select></label>
