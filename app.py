@@ -502,6 +502,26 @@ def fdiag(P=print, storms=None):
             li = max(x[0] for x in mine); cur = [x for x in mine if x[0] == li]
             p72 = next(((x[3], x[4]) for x in cur if x[2] == 72), None)
             P(f"  {tech:<7} {GUESS.get(tech, '?'):<14} {len({x[0] for x in mine}):>8}  {li:>12}  {len(cur):>8}  {max(x[2] for x in cur):>6}  {p72 or '-'}")
+    P("\n== Google DeepMind Weather Lab（AIアンサンブル）")
+    now = datetime.now(timezone.utc)
+    base = now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0)
+    for model in WL_MODELS:
+        for i in range(6):
+            cyc = base - timedelta(hours=6 * i)
+            url = WL_URL.format(model=model, kind="ensemble", ts=cyc.strftime("%Y_%m_%dT%H_00"))
+            try:
+                r = requests.get(url, headers=UA, timeout=60)
+            except Exception as e:
+                P(model, cyc.strftime("%m/%d %HZ"), "取得失敗", repr(e)); break
+            if r.status_code != 200 or r.text.lstrip()[:1] == "<":
+                P(model, cyc.strftime("%m/%d %HZ"), f"HTTP {r.status_code}"); continue
+            lines = r.text.splitlines()
+            g = wl_parse(r.text)
+            P(f"{model} {cyc.strftime('%m/%d %HZ')} OK {len(r.content)//1024}KB  {url}")
+            P("  列名:", lines[0][:300])
+            P("  1行目:", lines[1][:300] if len(lines) > 1 else "-")
+            P("  パース結果:", {k: len(v) for k, v in list(g.items())[:12]}, "（台風ID: メンバー数）")
+            break
 
 # ---------------- API ----------------
 @asynccontextmanager
@@ -679,7 +699,162 @@ def ll_dist(a, b):
 # アンサンブルは ATCF の慣例: GEFS=AC00/AP01-30/AEMN、CMC=CC00/CP01-20/CEMN、NAVGEM=NC00/NP01-20/NEMN
 DET = {"UKM": "UKMET", "NGX": "NAVGEM", "CMC": "CMC", "JTWC": "JTWC公式", "AVNO": "GFS", "GFSO": "GFS",
        "EMX": "ECMWF", "ECMF": "ECMWF", "JGSM": "JMA-GSM", "HWRF": "HWRF", "HAFS": "HAFS", "CTCX": "COAMPS-TC"}
-ENS = {"GEFS": (r"AP\d\d", "AEMN"), "CMC-EPS": (r"CP\d\d", "CEMN"), "NAVGEM-EPS": (r"NP\d\d", "NEMN")}
+# アンサンブルの技術ID（ATCF慣例）: 先頭1文字=機関、メンバー=xP01〜、コントロール=xC00/xE00、平均=xEMN
+#   A=GEFS(NCEP) C=CMC-EPS N=NAVGEM-EPS E=ECMWF-ENS U=UKMET(MOGREPS) J=JMA-GEPS
+# a-deck に載っているものを自動検出する（載っていない機関は黙って飛ばし、画面の注記に「無いモデル」として出す）
+ENS_LET = {"A": "GEFS", "C": "CMC-EPS", "N": "NAVGEM-EPS", "E": "ECMWF-ENS", "U": "UKMET-ENS", "J": "JMA-GEPS"}
+ENS_ID = re.compile(r"([A-Z])(P\d\d|C00|E00)")
+
+# Google DeepMind Weather Lab（AIの台風アンサンブル。WNV3=64メンバー、FNV3=50メンバー、GENC=GenCast）
+# URLは環境変数 WEATHERLAB_URL で差し替え可（{model} {kind} {ts} が置換される）。/api/fdiag で取得状況とCSVの列名を確認できる
+WL_URL = os.environ.get("WEATHERLAB_URL",
+    "https://deepmind.google.com/science/weatherlab/download/cyclones/{model}/{kind}/paired/csv/{model}_{kind}_{ts}_paired.csv")
+WL_MODELS = {"WNV3": "WeatherNext3(AI)", "FNV3": "WeatherNext2(AI)", "GENC": "GenCast(AI)"}
+
+# 強さの階級（気象庁・10分間平均風速m/s）。モデルの風速は1分間平均(ATCF)なので 0.88 倍して10分間平均相当にする
+CATS = [(54, "猛烈な"), (44, "非常に強い"), (33, "強い"), (17.2, "台風"), (0, "熱帯低気圧")]
+W10 = 0.88
+
+def _w10(kt, is10=False):
+    """kt → 10分間平均相当のm/s（JMA公式はそのまま）"""
+    return None if not kt else kt * KT2MS * (1 if is10 else W10)
+
+def _pct(a, p):
+    a = sorted(a); k = (len(a) - 1) * p; f = int(k); c = min(f + 1, len(a) - 1)
+    return a[f] + (a[c] - a[f]) * (k - f)
+
+def _r1(v):
+    return None if v is None else round(v, 1)
+
+def intensity_rows(tracks, is10=False, probs=False):
+    """tracks: [{tau: (風速kt, 気圧hPa)}]（1本=1メンバー or 1モデル）→ 12時間刻みの強さ統計。
+    行: [tau, 風速平均, 風速P10, 風速P90, 気圧平均, 気圧P10, 気圧P90, 本数, [強い以上%, 非常に強い以上%, 猛烈な%]|None, 風速最小, 風速最大]（風速はm/s）"""
+    rows = []
+    for t in sorted({t for tr in tracks for t in tr if t % 12 == 0}):
+        ws = [w for tr in tracks if t in tr and (w := _w10(tr[t][0], is10))]
+        ps = [tr[t][1] for tr in tracks if t in tr and tr[t][1]]
+        if not ws and not ps:
+            continue
+        pr = [round(100 * sum(w >= th for w in ws) / len(ws)) for th in (33, 44, 54)] if (probs and ws) else None
+        rows.append([t,
+                     _r1(sum(ws) / len(ws)) if ws else None, _r1(_pct(ws, .1)) if ws else None, _r1(_pct(ws, .9)) if ws else None,
+                     round(sum(ps) / len(ps)) if ps else None, round(_pct(ps, .1)) if ps else None, round(_pct(ps, .9)) if ps else None,
+                     max(len(ws), len(ps)), pr, _r1(min(ws)) if ws else None, _r1(max(ws)) if ws else None])
+    return rows
+
+def mean_track(members):
+    """メンバー（[[tau, lat, lon, kt, hPa], ...]）から平均進路を作る。存続メンバーが1/3未満の時刻は捨てる。"""
+    by = {}
+    for m in members:
+        for x in m:
+            by.setdefault(x[0], []).append(x)
+    out = []
+    for t in sorted(by):
+        g = by[t]
+        if len(g) < max(2, len(members) // 3):
+            continue
+        lo0 = g[0][2]
+        vs = [x[3] for x in g if x[3]]; ps = [x[4] for x in g if x[4]]
+        out.append([t, round(sum(x[1] for x in g) / len(g), 1),
+                    round(lo0 + sum((x[2] - lo0 + 540) % 360 - 180 for x in g) / len(g), 1),
+                    round(sum(vs) / len(vs)) if vs else None, round(sum(ps) / len(ps)) if ps else None])
+    return out
+
+def _wl_time(s):
+    return datetime.strptime(s.strip().replace("Z", "")[:19].replace("T", " "), F)
+
+def wl_parse(text):
+    """Weather Lab の CSV → {track_id: {member: {tau: (lat, lon, kt, hPa)}}}。列名は部分一致で探す（列の順序や細かい名前に依存しない）。
+    観測（paired の実況）行はメンバー列が空か source が観測系なので除外する。"""
+    rd = csv.reader(io.StringIO(text))
+    head = next(rd, None)
+    if not head:
+        return {}
+    h = [c.strip().lower() for c in head]
+    def col(*keys, bad=()):
+        for k in keys:
+            for i, c in enumerate(h):
+                if k in c and not any(b in c for b in bad):
+                    return i
+        return None
+    i_tr, i_mem = col("track_id", "storm_id", "track", "sid"), col("sample", "member", "ensemble")
+    i_ini, i_val, i_lead = col("init"), col("valid"), col("lead")
+    i_lat, i_lon = col("lat"), col("lon")
+    i_w = col("wind", bad=("radius", "r34", "r50", "r64", "rmw"))
+    i_p = col("pressure", "pres", "slp", bad=("radius",))
+    i_src = col("source")
+    if None in (i_tr, i_lat, i_lon):
+        return {}
+    ms_unit = i_w is not None and any(k in h[i_w] for k in ("m_s", "ms", "mps")) and "knot" not in h[i_w] and "kt" not in h[i_w]
+    out = {}
+    for row in rd:
+        try:
+            if i_mem is None or not row[i_mem].strip():
+                continue
+            if i_src is not None and any(k in row[i_src].lower() for k in ("obs", "best", "vital", "truth", "anal")):
+                continue
+            tau = None
+            if i_lead is not None:
+                try: tau = int(round(float(row[i_lead])))
+                except ValueError: tau = None
+            if tau is None and i_ini is not None and i_val is not None:
+                tau = int(round((_wl_time(row[i_val]) - _wl_time(row[i_ini])).total_seconds() / 3600))
+            if tau is None or tau < 0:
+                continue
+            la, lo = float(row[i_lat]), float(row[i_lon])
+            v = num(row[i_w]) if i_w is not None else None
+            p = num(row[i_p]) if i_p is not None else None
+            if v is not None and ms_unit:
+                v = v * MS2KT
+            out.setdefault(row[i_tr].strip().upper(), {}).setdefault(row[i_mem].strip(), {})[tau] = (
+                round(la, 1), round(lo, 1), round(v) if v and v > 0 else None, round(p) if p and p > 0 else None)
+        except (ValueError, IndexError):
+            continue
+    return out
+
+def wl_fetch(model, cyc):
+    """Weather Lab の1サイクルぶん（全台風）を取得してパース。無ければ None。30分キャッシュ。"""
+    def go():
+        url = WL_URL.format(model=model, kind="ensemble", ts=cyc.strftime("%Y_%m_%dT%H_00"))
+        try:
+            r = requests.get(url, headers=UA, timeout=60)
+        except requests.RequestException as e:
+            print("WeatherLab", model, cyc, repr(e), flush=True)
+            return None
+        if r.status_code != 200 or r.text.lstrip()[:1] == "<":
+            return None
+        return wl_parse(r.text)
+    if len(_fc_cache) > 40:  # 古いキャッシュを捨てる
+        for k, _ in sorted(_fc_cache.items(), key=lambda kv: kv[1][0])[:15]:
+            _fc_cache.pop(k, None)
+    return _cached(f"wl:{model}:{cyc:%Y%m%d%H}", 1800, go)
+
+def wl_ens(sid):
+    """Weather Lab のAIアンサンブル → (ens要素のリスト, 取得状況)。"""
+    nn, now = sid[2:], datetime.now(timezone.utc)
+    yr = now.year
+    base = now.replace(hour=now.hour // 6 * 6, minute=0, second=0, microsecond=0)
+    cycles = [base - timedelta(hours=6 * i) for i in range(6)]
+    def one(model):
+        for cyc in cycles:
+            g = wl_fetch(model, cyc)
+            if not g:
+                continue
+            key = next((k for k in g if k in (f"WP{nn}{yr}".upper(), f"{sid}{yr}".upper())), None)
+            if key:
+                return model, cyc, g[key]
+        return model, None, None
+    with ThreadPoolExecutor(len(WL_MODELS)) as ex:
+        res = list(ex.map(one, WL_MODELS))
+    ens, st = [], []
+    for model, cyc, tr in res:
+        mem = [[[t, *m[t]] for t in sorted(m)] for m in (tr or {}).values()]
+        mem = [m for m in mem if len(m) > 1]
+        st.append({"name": WL_MODELS[model], "ok": bool(mem), "n": len(mem)})
+        if mem:
+            ens.append({"key": model, "label": WL_MODELS[model], "init": cyc.strftime("%Y%m%d%H"), "n": len(mem),
+                        "members": mem, "mean": mean_track(mem)})
+    return ens, st
 
 def _adeck(sid):
     yr = datetime.now(timezone.utc).year
@@ -688,17 +863,25 @@ def _adeck(sid):
     return r.headers.get("Last-Modified", ""), parse_adeck(r.text)
 
 def jma_fc(tc):
+    """気象庁の予報円（位置＋風速・気圧）。風速は forecast.json の maximumWind.sustained（m/s）をktに戻して保持。"""
     pts, init = [], ""
     for r in get_json(f"{BOSAI}/{tc}/forecast.json", []) or []:
         if isinstance(r, dict) and r.get("advancedHours") is not None:
-            try: pts.append([int(r["advancedHours"]), float(r["center"][0]), float(r["center"][1])])
+            try:
+                w = num(((r.get("maximumWind") or {}).get("sustained") or {}).get("m/s"))
+                pts.append([int(r["advancedHours"]), float(r["center"][0]), float(r["center"][1]),
+                            round(w * MS2KT, 1) if w else None, num(r.get("pressure")) or None])
             except (KeyError, TypeError, ValueError, IndexError): continue
             if r["advancedHours"] == 0: init = re.sub(r"\D", "", str((r.get("validtime") or {}).get("UTC", "")))[:10]
-    return {"init": init, "pts": sorted(pts)} if len(pts) > 1 else None
+    return {"init": init, "pts": sorted(pts), "is10": True} if len(pts) > 1 else None
 
 def build_forecast(sid, jma=""):
-    lm, rows = _cached("ad:" + sid, 900, lambda: _adeck(sid))
-    top = datetime.strptime(max(x[0] for x in rows), "%Y%m%d%H") if rows else None
+    errs, lm, rows = [], "", []
+    try:
+        lm, rows = _cached("ad:" + sid, 900, lambda: _adeck(sid))
+    except requests.RequestException as e:
+        errs.append(f"UCAR RAL: {e}")
+    top = datetime.strptime(max(x[0] for x in rows), "%Y%m%d%H") if rows else datetime.now(timezone.utc).replace(tzinfo=None)
     by = {}
     for init, tech, tau, la, lo, v, p in rows:
         if 0 <= tau <= 240: by.setdefault(tech, {}).setdefault(init, {})[tau] = (tau, round(la, 1), round(lo, 1), v, p)
@@ -709,18 +892,34 @@ def build_forecast(sid, jma=""):
         if datetime.strptime(i, "%Y%m%d%H") < top - timedelta(hours=48) or len(d[i]) < 2: return None
         return i, [d[i][t] for t in sorted(d[i])]
     models = [{"key": t, "label": lb, "init": g[0], "pts": [list(x) for x in g[1]]} for t, lb in DET.items() if (g := last(t))]
+    # --- a-deck のアンサンブル（機関ごとに自動検出）
+    fam = {}
+    for tech in sorted(by):
+        m = ENS_ID.fullmatch(tech)
+        if m and (g := last(tech)):
+            fam.setdefault(m.group(1), []).append(g)
     ens = []
-    for name, (pat, mean) in ENS.items():
-        mem = [g for t in sorted(by) if re.fullmatch(pat, t) and (g := last(t))]
-        if not mem: continue
+    for L, mem in fam.items():
+        if L not in ENS_LET and len(mem) < 5:  # 未知の頭文字は5本以上そろった時だけ採用（誤検出防止）
+            continue
         init = max(g[0] for g in mem)
-        gm = last(mean)
-        ens.append({"key": name, "label": name, "init": init, "n": sum(g[0] == init for g in mem),
-                    "members": [[[x[0], x[1], x[2]] for x in g[1]] for g in mem if g[0] == init],
-                    "mean": [[x[0], x[1], x[2]] for x in gm[1]] if gm and gm[0] == init else []})
+        cur = [[[x[0], x[1], x[2], x[3], x[4]] for x in g[1]] for g in mem if g[0] == init]
+        gm = last(L + "EMN")
+        name = ENS_LET.get(L, f"ENS-{L}")
+        ens.append({"key": name, "label": name, "init": init, "n": len(cur), "members": cur,
+                    "mean": [[x[0], x[1], x[2], x[3], x[4]] for x in gm[1]] if gm and gm[0] == init else mean_track(cur)})
+    # --- Weather Lab（AIアンサンブル）
+    wl_ok = False
+    try:
+        wens, wst = wl_ens(sid)
+        ens += wens
+        wl_ok = bool(wens)
+    except Exception as e:  # 取得元が変わっても他のモデルは止めない
+        wst = []
+        errs.append(f"Weather Lab: {e!r}")
     car = by.get("CARQ"); ana = None
     if car:
-        i = max(car); x = car[i][min(car[i])]; ana = {"init": i, "lat": x[1], "lon": x[2]}
+        i = max(car); x = car[i][min(car[i])]; ana = {"init": i, "lat": x[1], "lon": x[2], "w": x[3], "p": x[4]}
     jm = jma_fc(jma) if jma else None
     cand = [(m["label"], {x[0]: (x[1], x[2]) for x in m["pts"]}) for m in models]
     cand += [(e["label"] + "平均", {x[0]: (x[1], x[2]) for x in e["mean"]}) for e in ens if e["mean"]]
@@ -736,8 +935,21 @@ def build_forecast(sid, jma=""):
             for i, pos in ps: col[i] = ll_dist(pos, (la_m, lo_m))
         for i, v in enumerate(col): srows[i][1].append(v)
         mx.append(max((v for v in col if v is not None), default=None)); nn.append(len(ps))
+    # --- 強さの予報（風速m/s＝10分間平均相当、中心気圧hPa）
+    ser = []
+    def add_int(label, kind, init, tracks, is10=False):
+        r = intensity_rows(tracks, is10, probs=(kind == "ens"))
+        if r: ser.append({"label": label, "kind": kind, "init": init, "n": len(tracks), "rows": r})
+    if jm: add_int("JMA公式", "det", jm["init"], [{x[0]: (x[3], x[4]) for x in jm["pts"]}], True)
+    for m in models: add_int(m["label"], "det", m["init"], [{x[0]: (x[3], x[4]) for x in m["pts"]}])
+    for e in ens: add_int(e["label"], "ens", e["init"], [{x[0]: (x[3], x[4]) for x in mem} for mem in e["members"]])
+    if not (models or ens or jm):
+        raise requests.RequestException("; ".join(errs) or "予報データがありません")
     return {"id": sid, "updated": lm, "analysis": ana, "models": models, "ens": ens, "jma": jm,
-            "spread": {"taus": taus, "rows": srows, "max": mx, "n": nn}}
+            "spread": {"taus": taus, "rows": srows, "max": mx, "n": nn},
+            "intensity": {"series": ser},
+            "sources": {"adeck": bool(rows), "weatherlab": wst, "weatherlab_ok": wl_ok, "errors": errs,
+                        "members": sum(e["n"] for e in ens)}}
 
 @app.get("/api/forecast/storms")
 def fc_storms():
@@ -806,7 +1018,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 <div id="top" class="card"><nav><a href="/">台風DB</a><b>予報比較</b></nav><select id="sel" aria-label="台風"></select><button class="ib" id="rf" aria-label="更新">⟳</button></div>
 <div id="bar" class="card">
  <div id="chips"></div>
- <div class="row"><label><input type="checkbox" id="mem" checked>アンサンブルの各メンバー</label><button class="btn" id="tbl">ばらつき表</button></div>
+ <div class="row"><label><input type="checkbox" id="mem" checked>アンサンブルの各メンバー</label><button class="btn" id="tbl">ばらつき表</button><button class="btn" id="int">強さ予報</button></div>
  <div class="row"><input id="tau" type="range" min="0" max="120" step="6" value="48" aria-label="予報時間"><b id="tv">+48h</b></div>
  <div id="pos"></div><div id="note"></div>
 </div>
@@ -814,7 +1026,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script>
 const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const COL={"JMA公式":"#ffffff",UKMET:"#ff8a3d",NAVGEM:"#a78bfa",CMC:"#34d399",GEFS:"#38bdf8","CMC-EPS":"#10b981","NAVGEM-EPS":"#c4b5fd",ECMWF:"#f43f5e",GFS:"#facc15","JMA-GSM":"#f9a8d4","JTWC公式":"#ef4444"};
+const COL={"JMA公式":"#ffffff",UKMET:"#ff8a3d",NAVGEM:"#a78bfa",CMC:"#34d399",GEFS:"#38bdf8","CMC-EPS":"#10b981","NAVGEM-EPS":"#c4b5fd",ECMWF:"#f43f5e",GFS:"#facc15","JMA-GSM":"#f9a8d4","JTWC公式":"#ef4444","ECMWF-ENS":"#fb7185","UKMET-ENS":"#fb923c","JMA-GEPS":"#e879f9","WeatherNext3(AI)":"#22d3ee","WeatherNext2(AI)":"#2dd4bf","GenCast(AI)":"#a3e635"};
 const colr=k=>COL[k]||"#94a3b8";
 const map=L.map("map",{zoomControl:false,worldCopyJump:true}).setView([28,140],5);
 L.control.zoom({position:"bottomright"}).addTo(map);
@@ -828,24 +1040,34 @@ const fmt=i=>i?`${i.slice(4,6)}/${i.slice(6,8)} ${i.slice(8,10)}Z`:"";
 const at=(p,t)=>{for(let i=0;i<p.length;i++){if(p[i][0]==t)return[p[i][1],w(p[i][2])];
   if(p[i][0]>t){if(!i)return null;const a=p[i-1],b=p[i],f=(t-a[0])/(b[0]-a[0]);return[a[1]+(b[1]-a[1])*f,w(a[2])+(w(b[2])-w(a[2]))*f]}}return null};
 const line=(g,p,c,o)=>L.polyline(p.map(x=>[x[1],w(x[2])]),{color:c,...o}).addTo(g);
-function add(label,init,pts,o={}){const c=colr(label),g=L.layerGroup();
+const KT=0.514444,CATS=[[54,"猛烈な"],[44,"非常に強い"],[33,"強い"],[17.2,"台風"],[0,"熱帯低気圧"]];
+const w10=(kt,is10)=>kt==null?null:kt*KT*(is10?1:.88);   // ATCFの1分間平均→気象庁の10分間平均相当(×0.88)
+const cat=v=>v==null?"":CATS.find(c=>v>=c[0])[1];
+const itxt=(kt,hp,is10)=>{const v=w10(kt,is10);return(v!=null?`${v.toFixed(0)}m/s`:"")+(hp?` ${Math.round(hp)}hPa`:"")+(v!=null?` ${cat(v)}`:"")};
+const atv=(p,t)=>{for(let i=0;i<p.length;i++){if(p[i][0]==t)return[p[i][3],p[i][4]];
+  if(p[i][0]>t){if(!i)return[null,null];const a=p[i-1],b=p[i],f=(t-a[0])/(b[0]-a[0]),l=(x,y)=>x==null||y==null?null:x+(y-x)*f;return[l(a[3],b[3]),l(a[4],b[4])]}}return[null,null]};
+const mrange=(it,t)=>{if(!it.members)return"";const v=it.members.map(m=>atv(m,t)[0]).filter(x=>x!=null).map(x=>w10(x,false));
+  return v.length<2?"":` <small style="color:var(--sub)">メンバー${Math.min(...v).toFixed(0)}–${Math.max(...v).toFixed(0)}m/s(${v.length}本)</small>`};
+function add(label,init,pts,o={}){const c=colr(label),g=L.layerGroup(),it={label,init,c,g,pts,visible:true,is10:!!o.is10};
   line(g,pts,c,{weight:o.w||3,dashArray:o.dash,opacity:.95});
   pts.forEach(p=>{if(p[0]&&p[0]%24==0)L.circleMarker([p[1],w(p[2])],{radius:4,color:"#fff",weight:1,fillColor:c,fillOpacity:1})
-    .bindTooltip(`${esc(label)} +${p[0]}h${p[3]?` ${p[3]}kt`:""}`).addTo(g)});
-  const it={label,init,c,g,pts,visible:true};items.push(it);return it}
+    .bindTooltip(`${esc(label)} +${p[0]}h ${itxt(p[3],p[4],it.is10)}`).addTo(g)});
+  items.push(it);return it}
 function build(){
   items.forEach(i=>{i.g.remove();i.mem&&i.mem.remove()});items=[];ana.clearLayers();
   ref=d.analysis?d.analysis.lon:140;
-  if(d.jma)add("JMA公式",d.jma.init,d.jma.pts,{w:4});
+  if(d.jma)add("JMA公式",d.jma.init,d.jma.pts,{w:4,is10:true});
   d.models.forEach(m=>add(m.label,m.init,m.pts));
-  d.ens.forEach(e=>{const it=add(e.label,e.init,e.mean,{dash:"6 5"});it.tag=`${e.n}メンバー`;
+  d.ens.forEach(e=>{const it=add(e.label,e.init,e.mean,{dash:"6 5"});it.tag=`${e.n}メンバー`;it.members=e.members;
     it.mem=L.layerGroup();e.members.forEach(m=>line(it.mem,m,it.c,{weight:1,opacity:.3}))});
   if(d.analysis)L.circleMarker([d.analysis.lat,w(d.analysis.lon)],{radius:6,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip("解析位置 "+fmt(d.analysis.init)).addTo(ana);
   $("#chips").innerHTML=items.map((it,i)=>`<button class="chip" data-i="${i}" style="--c:${it.c}"><i></i>${esc(it.label)}<small>${fmt(it.init)}${it.tag?" "+it.tag:""}</small></button>`).join("");
   const mx=Math.min(240,Math.max(24,...items.map(i=>i.pts.length?i.pts[i.pts.length-1][0]:0)));
   $("#tau").max=mx;if(+$("#tau").value>mx)$("#tau").value=48;
-  const have=items.map(i=>i.label),miss=["ECMWF","GFS","JMA-GSM"].filter(x=>!have.includes(x)),u=new Date(d.updated);
-  $("#note").textContent=`取得元: UCAR RAL（ATCF a-deck）${isNaN(u)?"":" 更新 "+u.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}。`+(miss.length?`この取得元に無いモデル: ${miss.join("・")}。`:"")+"予報は参考値です。防災には気象庁の情報を確認してください。";
+  const have=items.map(i=>i.label),miss=["ECMWF","GFS","JMA-GSM","ECMWF-ENS","UKMET-ENS","JMA-GEPS","GEFS"].filter(x=>!have.includes(x)),u=new Date(d.updated),s=d.sources||{};
+  $("#note").textContent=`取得元: UCAR RAL（ATCF a-deck）${isNaN(u)?"":" 更新 "+u.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}`+
+    (s.weatherlab_ok?" ＋ Google DeepMind Weather Lab（AI）":"")+`。アンサンブル計${s.members||0}メンバー。`+
+    (miss.length?`この取得元に無いモデル: ${miss.join("・")}。`:"")+"風速は10分間平均相当(モデルは1分間平均×0.88)。予報は参考値です。防災には気象庁の情報を確認してください。";
   apply();
   const ll=[];items.forEach(it=>it.pts.forEach(p=>ll.push([p[1],w(p[2])])));if(d.analysis)ll.push([d.analysis.lat,w(d.analysis.lon)]);
   if(ll.length)map.fitBounds(L.latLngBounds(ll),{paddingTopLeft:[20,70],paddingBottomRight:[20,($("#bar").offsetHeight||200)+20]});
@@ -855,7 +1077,8 @@ function apply(){items.forEach(it=>{it.visible?it.g.addTo(map):it.g.remove();
 function marks(){tm.clearLayers();const t=+$("#tau").value,out=[];$("#tv").textContent=`+${t}h`;
   items.forEach(it=>{if(!it.visible)return;const p=at(it.pts,t);if(!p)return;
     L.circleMarker(p,{radius:8,color:"#fff",weight:2,fillColor:it.c,fillOpacity:.9,interactive:false}).addTo(tm);
-    out.push(`<span><span style="color:${it.c}">●</span> ${esc(it.label)} ${p[0].toFixed(1)}N ${((p[1]%360+360)%360).toFixed(1)}E</span>`)});
+    const q=atv(it.pts,t);
+    out.push(`<span><span style="color:${it.c}">●</span> ${esc(it.label)} ${p[0].toFixed(1)}N ${((p[1]%360+360)%360).toFixed(1)}E <b>${itxt(q[0],q[1],it.is10)}</b>${mrange(it,t)}</span>`)});
   $("#pos").innerHTML=out.join("")||"この時間の予報はありません"}
 $("#chips").onclick=e=>{const b=e.target.closest(".chip");if(!b)return;const it=items[+b.dataset.i];it.visible=!it.visible;b.classList.toggle("off",!it.visible);apply()};
 $("#mem").onchange=apply;$("#tau").oninput=marks;
@@ -865,6 +1088,37 @@ $("#tbl").onclick=()=>{if(!d)return;const s=d.spread,dl=$("#dlg"),n=v=>v==null?"
    <table><tr><th></th>${s.taus.map(t=>`<th>+${t}h</th>`).join("")}</tr>${s.rows.map(r=>`<tr><td>${esc(r[0])}</td>${r[1].map(v=>`<td>${n(v)}</td>`).join("")}</tr>`).join("")}
    <tr><td>平均からの最大</td>${s.max.map(v=>`<td><b>${n(v)}</b></td>`).join("")}</tr><tr><td>モデル数</td>${s.n.map(v=>`<td>${v}</td>`).join("")}</tr></table>`;dl.showModal()};
 $("#dlg").addEventListener("click",e=>{if(e.target.id=="dlg")e.target.close()});
+let met="w";
+function chart(){
+ const S=(d.intensity||{series:[]}).series,W=520,H=250,L0=42,R0=10,T0=10,B0=26,isW=met=="w",ix=isW?[1,2,3]:[4,5,6],vs=[];
+ S.forEach(s=>s.rows.forEach(r=>ix.forEach(i=>{if(r[i]!=null)vs.push(r[i])})));
+ if(!vs.length)return"<p style='color:var(--sub)'>この項目の予報値がありません</p>";
+ let lo,hi;
+ if(isW){lo=0;hi=Math.max(60,Math.ceil(Math.max(...vs)/10)*10)}else{lo=Math.floor((Math.min(...vs)-4)/10)*10;hi=Math.ceil((Math.max(...vs)+4)/10)*10}
+ const tm=Math.max(24,...S.map(s=>s.rows[s.rows.length-1][0])),
+  X=t=>L0+(W-L0-R0)*t/tm,Y=v=>isW?T0+(H-T0-B0)*(1-(v-lo)/(hi-lo)):T0+(H-T0-B0)*(v-lo)/(hi-lo),st=isW?10:20;
+ let g="";
+ for(let v=Math.ceil(lo/st)*st;v<=hi;v+=st)g+=`<line x1="${L0}" x2="${W-R0}" y1="${Y(v)}" y2="${Y(v)}" stroke="#22314f"/><text x="${L0-5}" y="${Y(v)+4}" fill="#8b9bbb" font-size="10" text-anchor="end">${v}</text>`;
+ for(let t=0;t<=tm;t+=24)g+=`<line x1="${X(t)}" x2="${X(t)}" y1="${T0}" y2="${H-B0}" stroke="#22314f"/><text x="${X(t)}" y="${H-8}" fill="#8b9bbb" font-size="10" text-anchor="middle">+${t}h</text>`;
+ if(isW)[[33,"強い"],[44,"非常に強い"],[54,"猛烈な"]].forEach(([v,n])=>{if(v<hi)g+=`<line x1="${L0}" x2="${W-R0}" y1="${Y(v)}" y2="${Y(v)}" stroke="#8b9bbb" stroke-dasharray="4 4"/><text x="${W-R0-2}" y="${Y(v)-3}" fill="#8b9bbb" font-size="10" text-anchor="end">${n}</text>`});
+ S.forEach(s=>{const c=colr(s.label),rs=s.rows.filter(r=>r[ix[0]]!=null);if(!rs.length)return;
+  if(s.kind=="ens"&&rs.length>1){const a=rs.map(r=>`${X(r[0])},${Y(r[ix[2]])}`),b=rs.map(r=>`${X(r[0])},${Y(r[ix[1]])}`).reverse();
+   g+=`<polygon points="${a.concat(b).join(" ")}" fill="${c}" opacity=".16"/>`}
+  g+=`<polyline points="${rs.map(r=>`${X(r[0])},${Y(r[ix[0]])}`).join(" ")}" fill="none" stroke="${c}" stroke-width="${s.kind=="ens"?2:2.5}"${s.kind=="ens"?' stroke-dasharray="6 4"':""}/>`});
+ return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${g}</svg>`}
+function openInt(){if(!d)return;const S=(d.intensity||{series:[]}).series,dl=$("#dlg"),f=v=>v==null?"-":Math.round(v),T=[24,48,72,96,120],ens=S.filter(s=>s.kind=="ens");
+ const legend=S.map(s=>`<span class="chip" style="--c:${colr(s.label)};min-height:26px;font-size:11px;cursor:default"><i></i>${esc(s.label)}${s.kind=="ens"?`<small>${s.n}本</small>`:""}</span>`).join("");
+ const cell=(s,t)=>{const r=s.rows.find(x=>x[0]==t);if(!r)return"<td>-</td>";
+  return`<td><b>${f(r[1])}</b><br><small style="color:var(--sub)">${s.kind=="ens"?`${f(r[2])}–${f(r[3])}`:(r[4]?r[4]+"hPa":"")}</small></td>`};
+ const pr=ens.length?`<p style="color:var(--sub);font-size:12px;margin-top:14px">各階級以上になるメンバーの割合（強い以上／非常に強い以上／猛烈な, %）</p>
+  <table><tr><th></th>${T.map(t=>`<th>+${t}h</th>`).join("")}</tr>${ens.map(s=>`<tr><td>${esc(s.label)}</td>${T.map(t=>{const r=s.rows.find(x=>x[0]==t);return`<td>${r&&r[8]?r[8].join("/"):"-"}</td>`}).join("")}</tr>`).join("")}</table>`:"";
+ dl.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b>強さの予報</b><button class="ib" onclick="$('#dlg').close()" aria-label="閉じる">✕</button></div>
+  <div class="row"><button class="btn" onclick="met='w';openInt()" style="${met=="w"?"background:var(--acc);color:#04121f":""}">風速(m/s)</button><button class="btn" onclick="met='p';openInt()" style="${met=="p"?"background:var(--acc);color:#04121f":""}">中心気圧(hPa)</button></div>
+  ${chart()}<div style="display:flex;flex-wrap:wrap;gap:4px;margin:6px 0">${legend}</div>
+  <p style="color:var(--sub);font-size:12px">実線=決定論モデル、破線＋帯=アンサンブル平均と10–90%範囲。風速は10分間平均相当(モデルは1分間平均×0.88)。全球モデルは分解能の都合で猛烈な台風を弱めに予報しがちです。</p>
+  <table><tr><th></th>${T.map(t=>`<th>+${t}h</th>`).join("")}</tr>${S.map(s=>`<tr><td style="color:${colr(s.label)}">${esc(s.label)}</td>${T.map(t=>cell(s,t)).join("")}</tr>`).join("")}</table>${pr}`;
+ if(!dl.open)dl.showModal()}
+$("#int").onclick=openInt;
 async function load(){const o=$("#sel").selectedOptions[0];if(!o)return;$("#note").textContent="読み込み中…";
   try{const r=await fetch(`/api/forecast/${o.value}?jma=${o.dataset.jma||""}`);if(!r.ok)throw 0;d=await r.json();build()}
   catch(e){$("#note").textContent="予報データを取得できませんでした。少し待ってから ⟳ を押してください"}}
