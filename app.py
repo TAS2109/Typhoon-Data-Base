@@ -1180,9 +1180,9 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
   <div class="scroll">
    <h3 class="sh">選んだ時間の予報（位置と強さ）</h3><div id="pos"></div>
    <h3 class="sh">強さの表示</h3>
-   <div class="btns"><button type="button" class="btn" id="oInlay">線にも強さの色</button><button type="button" class="btn" id="oNum">風速を数字で</button>
+   <div class="btns"><button type="button" class="btn on" id="oInlay">線を強さで色分け</button><button type="button" class="btn" id="oNum">風速を数字で</button>
     <select id="oStep" aria-label="印の間隔"><option value="12">12時間ごと</option><option value="24" selected>24時間ごと</option></select></div>
-   <div class="note" style="margin-top:6px">印の中の色と大きさが強さ、外側の輪の色が予報の出どころ（モデル）です。円は単独モデル、菱形はアンサンブル平均。</div>
+   <div class="note" style="margin-top:6px">進路線は、極細の外枠の色が予報の出どころ（モデル）、内側の実線の色が強さです。印も同じで、中の色と大きさが強さ、外側の輪がモデル。円は単独モデル、菱形はアンサンブル平均。ボタンを切ると線はモデルの色だけになります。</div>
    <h3 class="sh">ソース（タップで表示・非表示）</h3><div id="fchips"></div>
    <label class="chk"><input type="checkbox" id="mem" checked>アンサンブルの各メンバーの進路も表示</label>
    <h3 class="sh">詳しく見る</h3>
@@ -1266,7 +1266,7 @@ function dbLayers(on){dbLayerList.forEach(l=>on?l.addTo(map):l.remove())}
 function legend(){
   const el=$("#legend");
   el.innerHTML=tab=="fc"
-    ?`<div class="lgh">強さ（印の中）</div>`+FCLS.map(c=>`<div><i class="dot" style="--s:${c[3]}px;background:${c[2]}"></i>${c[1]}</div>`).join("")+`<div class="lgh">外側の輪 = モデル</div>`
+    ?`<div class="lgh">強さ（印の中）</div>`+FCLS.map(c=>`<div><i class="dot" style="--s:${c[3]}px;background:${c[2]}"></i>${c[1]}</div>`).join("")+`<div class="lgh">細い外枠・輪 = モデル</div>`
     :[...CLS,UNK].map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
 }
 function setTab(t){
@@ -1485,7 +1485,7 @@ const kls=(kt,is10)=>{const v=w10(kt,is10);return v==null?UNKF:FCLS.find(c=>v>=c
 const itxt=(kt,hp,is10)=>{const v=w10(kt,is10),k=kls(kt,is10);return [v!=null?`${v.toFixed(0)}m/s`:"",hp?`${Math.round(hp)}hPa`:"",v!=null?k[1]:""].filter(Boolean).join(" ")};
 const tm=L.layerGroup(),ana=L.layerGroup();
 let items=[],d=null,ref=140,ready=false,active=false,met="w",fitFor="";
-const opt={step:24,inlay:false,num:false};
+const opt={step:24,inlay:true,num:false};
 const w=lo=>lo+360*Math.round((ref-lo)/360);   // 日付変更線をまたいでも線が飛ばないよう経度を連続化
 const fmt=i=>i?`${i.slice(4,6)}/${i.slice(6,8)} ${i.slice(8,10)}Z`:"";
 const avg=(a,b)=>a&&b?(a+b)/2:(a||b||null);
@@ -1501,9 +1501,10 @@ function mk(lat,lon,c,kt,is10,o){const k=kls(kt,is10),s=k[3]+(o.cur?4:0),S=s+(o.
 function draw(it){
   const g=it.g;g.clearLayers();
   const ll=it.pts.map(p=>[p[1],w(p[2])]);
-  if(opt.inlay){   // 外側=モデルの色、内側=その区間の強さの色
-    L.polyline(ll,{color:it.c,weight:7,opacity:.95,lineCap:"butt",dashArray:it.dash,interactive:false}).addTo(g);
-    for(let i=1;i<it.pts.length;i++)L.polyline([ll[i-1],ll[i]],{color:kls(avg(it.pts[i-1][3],it.pts[i][3]),it.is10)[2],weight:3,lineCap:"butt",interactive:false}).addTo(g);
+  if(opt.inlay){   // 極細の外枠=モデルの色(片側1px)、内側の実線=その区間の強さの色
+    const iw=it.big?6:5;
+    L.polyline(ll,{color:it.c,weight:iw+2,opacity:1,lineCap:"round",lineJoin:"round",interactive:false}).addTo(g);
+    for(let i=1;i<it.pts.length;i++)L.polyline([ll[i-1],ll[i]],{color:kls(avg(it.pts[i-1][3],it.pts[i][3]),it.is10)[2],weight:iw,opacity:1,lineCap:"round",interactive:false}).addTo(g);
   }else L.polyline(ll,{color:it.c,weight:it.big?4:3,dashArray:it.dash,opacity:.95,interactive:false}).addTo(g);
   it.pts.forEach(p=>{if(!p[0]||p[0]%opt.step)return;
     mk(p[1],w(p[2]),it.c,p[3],it.is10,{e:it.ens}).bindTooltip(`${esc(it.label)} +${p[0]}h ${itxt(p[3],p[4],it.is10)}`).addTo(g);
