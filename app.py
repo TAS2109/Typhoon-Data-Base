@@ -661,6 +661,228 @@ def detail(sid: str):
     for p in track: p["wind"] = to_ms(p["wind"])
     return {**t[0], "max_wind": to_ms(t[0]["max_wind"]), "track": track}
 
+# ---------------- 予報モデル比較（別タブ /forecast）----------------
+import time as _t
+_fc_cache = {}
+def _cached(key, ttl, fn):
+    v = _fc_cache.get(key)
+    if v and _t.time() - v[0] < ttl: return v[1]
+    r = fn(); _fc_cache[key] = (_t.time(), r); return r
+
+def ll_dist(a, b):
+    """2点間の距離[km]"""
+    r = math.radians
+    c = math.sin(r(a[0])) * math.sin(r(b[0])) + math.cos(r(a[0])) * math.cos(r(b[0])) * math.cos(r((a[1] - b[1] + 540) % 360 - 180))
+    return 6371 * math.acos(max(-1.0, min(1.0, c)))
+
+# a-deck の技術ID。実データ（fdiag）で確認できたもの: UKM=UKMET, NGX=NAVGEM, CMC=CMC。
+# アンサンブルは ATCF の慣例: GEFS=AC00/AP01-30/AEMN、CMC=CC00/CP01-20/CEMN、NAVGEM=NC00/NP01-20/NEMN
+DET = {"UKM": "UKMET", "NGX": "NAVGEM", "CMC": "CMC", "JTWC": "JTWC公式", "AVNO": "GFS", "GFSO": "GFS",
+       "EMX": "ECMWF", "ECMF": "ECMWF", "JGSM": "JMA-GSM", "HWRF": "HWRF", "HAFS": "HAFS", "CTCX": "COAMPS-TC"}
+ENS = {"GEFS": (r"AP\d\d", "AEMN"), "CMC-EPS": (r"CP\d\d", "CEMN"), "NAVGEM-EPS": (r"NP\d\d", "NEMN")}
+
+def _adeck(sid):
+    yr = datetime.now(timezone.utc).year
+    r = requests.get(f"{RAL}/plots/northwestpacific/{yr}/{sid}{yr}/a{sid}{yr}.dat", headers=UA, timeout=60)
+    r.raise_for_status()
+    return r.headers.get("Last-Modified", ""), parse_adeck(r.text)
+
+def jma_fc(tc):
+    pts, init = [], ""
+    for r in get_json(f"{BOSAI}/{tc}/forecast.json", []) or []:
+        if isinstance(r, dict) and r.get("advancedHours") is not None:
+            try: pts.append([int(r["advancedHours"]), float(r["center"][0]), float(r["center"][1])])
+            except (KeyError, TypeError, ValueError, IndexError): continue
+            if r["advancedHours"] == 0: init = re.sub(r"\D", "", str((r.get("validtime") or {}).get("UTC", "")))[:10]
+    return {"init": init, "pts": sorted(pts)} if len(pts) > 1 else None
+
+def build_forecast(sid, jma=""):
+    lm, rows = _cached("ad:" + sid, 900, lambda: _adeck(sid))
+    top = datetime.strptime(max(x[0] for x in rows), "%Y%m%d%H") if rows else None
+    by = {}
+    for init, tech, tau, la, lo, v, p in rows:
+        if 0 <= tau <= 240: by.setdefault(tech, {}).setdefault(init, {})[tau] = (tau, round(la, 1), round(lo, 1), v, p)
+    def last(tech):  # その技術IDの最新の初期時刻の予報（古すぎるものは捨てる）
+        d = by.get(tech)
+        if not d: return None
+        i = max(d)
+        if datetime.strptime(i, "%Y%m%d%H") < top - timedelta(hours=48) or len(d[i]) < 2: return None
+        return i, [d[i][t] for t in sorted(d[i])]
+    models = [{"key": t, "label": lb, "init": g[0], "pts": [list(x) for x in g[1]]} for t, lb in DET.items() if (g := last(t))]
+    ens = []
+    for name, (pat, mean) in ENS.items():
+        mem = [g for t in sorted(by) if re.fullmatch(pat, t) and (g := last(t))]
+        if not mem: continue
+        init = max(g[0] for g in mem)
+        gm = last(mean)
+        ens.append({"key": name, "label": name, "init": init, "n": sum(g[0] == init for g in mem),
+                    "members": [[[x[0], x[1], x[2]] for x in g[1]] for g in mem if g[0] == init],
+                    "mean": [[x[0], x[1], x[2]] for x in gm[1]] if gm and gm[0] == init else []})
+    car = by.get("CARQ"); ana = None
+    if car:
+        i = max(car); x = car[i][min(car[i])]; ana = {"init": i, "lat": x[1], "lon": x[2]}
+    jm = jma_fc(jma) if jma else None
+    cand = [(m["label"], {x[0]: (x[1], x[2]) for x in m["pts"]}) for m in models]
+    cand += [(e["label"] + "平均", {x[0]: (x[1], x[2]) for x in e["mean"]}) for e in ens if e["mean"]]
+    if jm: cand.append(("JMA公式", {x[0]: (x[1], x[2]) for x in jm["pts"]}))
+    taus = [24, 48, 72, 96, 120]; srows = [[lb, []] for lb, _ in cand]; mx, nn = [], []
+    for t in taus:  # 各モデルの予報位置が、全モデルの平均位置から何km離れているか
+        ps = [(i, tp[t]) for i, (_, tp) in enumerate(cand) if t in tp]
+        col = [None] * len(cand)
+        if len(ps) >= 2:
+            lo0 = ps[0][1][1]
+            la_m = sum(p[1][0] for p in ps) / len(ps)
+            lo_m = lo0 + sum((p[1][1] - lo0 + 540) % 360 - 180 for p in ps) / len(ps)
+            for i, pos in ps: col[i] = ll_dist(pos, (la_m, lo_m))
+        for i, v in enumerate(col): srows[i][1].append(v)
+        mx.append(max((v for v in col if v is not None), default=None)); nn.append(len(ps))
+    return {"id": sid, "updated": lm, "analysis": ana, "models": models, "ens": ens, "jma": jm,
+            "spread": {"taus": taus, "rows": srows, "max": mx, "n": nn}}
+
+@app.get("/api/forecast/storms")
+def fc_storms():
+    """予報比較の対象（UCARが公開している活動中の西太平洋の台風）。JMAの台風と名前で対応づける。"""
+    def go():
+        html = requests.get(f"{RAL}/current/", headers=UA, timeout=30).text
+        ids = sorted(set(re.findall(r"northwestpacific/\d{4}/(wp\d{2})\d{4}/", html)))
+        jm = []
+        for t in get_json(f"{BOSAI}/targetTc.json", []) or []:
+            tc = t.get("tropicalCyclone")
+            if tc: jm.append({"tc": tc, "num": str(t.get("typhoonNumber", "")),
+                              "name": _title_en(get_json(f"{BOSAI}/{tc}/specifications.json", []) or [])})
+        out = []
+        for i in ids:
+            m = re.search(r">\s*([^<>]*\(%s\))\s*<" % i.upper(), html)
+            label = re.sub(r"\s+", " ", m.group(1)).strip() if m else i.upper()
+            out.append({"id": i, "label": label, "jma": next((x for x in jm if x["name"] and x["name"] in label.upper()), None)})
+        return sorted(out, key=lambda s: s["id"][2:] >= "90")  # 番号のついた台風を先、invest(90番台)を後ろに
+    try: return _cached("fc:storms", 300, go)
+    except requests.RequestException as e: raise HTTPException(502, f"台風の一覧を取得できません: {e}")
+
+@app.get("/api/forecast/{sid}")
+def fc_detail(sid: str, jma: str = ""):
+    if not re.fullmatch(r"wp\d{2}", sid) or not re.fullmatch(r"[A-Za-z0-9]*", jma): raise HTTPException(404, "対象外です")
+    try: return _cached(f"fc:{sid}:{jma}", 600, lambda: build_forecast(sid, jma))
+    except requests.RequestException as e: raise HTTPException(502, f"予報データを取得できません: {e}")
+
+FPAGE = r"""<!doctype html>
+<html lang="ja"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a1120">
+<link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg">
+<title>台風 予報モデル比較</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;700;900&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#0a1120;--s1:#101a30;--s2:#17233f;--line:#22314f;--ink:#e9eefb;--sub:#8b9bbb;--acc:#38bdf8}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html{overscroll-behavior:none}
+body{margin:0;height:100dvh;background:var(--bg);color:var(--ink);font:14px/1.5 "Zen Kaku Gothic New",system-ui,sans-serif;overflow:hidden}
+button,select,input{font:inherit;color:var(--ink);touch-action:manipulation}
+#map{position:fixed;inset:0;background:#0b1522}
+.card{position:absolute;z-index:500;background:rgba(16,26,48,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:14px}
+#top{left:10px;right:10px;top:calc(10px + env(safe-area-inset-top));padding:8px;display:flex;gap:8px;align-items:center}
+nav{display:flex;background:var(--s2);border-radius:10px;padding:3px;flex:none}
+nav a,nav b{padding:6px 12px;border-radius:8px;font-size:13px;color:var(--sub);text-decoration:none}nav b{background:var(--acc);color:#04121f}
+#sel{flex:1;min-width:0;height:40px;padding:0 10px;font-size:16px;background:var(--s2);border:0;border-radius:10px}
+.ib{flex:none;width:40px;height:40px;border:0;border-radius:10px;background:var(--s2);font-size:16px}
+#bar{left:0;right:0;bottom:0;border-radius:20px 20px 0 0;border-width:1px 0 0;padding:12px 14px calc(12px + env(safe-area-inset-bottom));max-height:52dvh;overflow:auto}
+@media(min-width:761px){#bar{left:10px;bottom:10px;width:460px;border-radius:14px;border-width:1px}}
+#chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{border:1px solid var(--c);background:transparent;border-radius:99px;min-height:36px;padding:0 12px;font-size:13px;display:inline-flex;gap:6px;align-items:center}
+.chip i{width:10px;height:10px;border-radius:50%;background:var(--c)}.chip small{color:var(--sub);font-size:11px}
+.chip.off{opacity:.35}.chip.off i{background:transparent;border:1px solid var(--c)}
+.row{display:flex;align-items:center;gap:10px;margin-top:10px}.row label{flex:1;display:flex;align-items:center;gap:6px;font-size:13px}
+#tau{flex:1;height:32px;accent-color:var(--acc)}#tv{min-width:52px;text-align:right;font:700 16px system-ui}
+.btn{height:36px;padding:0 12px;border:0;border-radius:10px;background:var(--s2);font-size:13px}
+#pos{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12px;margin-top:6px;font-variant-numeric:tabular-nums}
+#note{margin-top:8px;color:var(--sub);font-size:11px}
+dialog{background:var(--s1);color:var(--ink);border:1px solid var(--line);border-radius:18px;width:min(560px,94vw);max-height:86dvh;padding:16px;overflow:auto}dialog::backdrop{background:#000b}
+table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}th,td{padding:6px 4px;text-align:right;border-bottom:1px solid var(--line)}th:first-child,td:first-child{text-align:left}
+.leaflet-tooltip{background:var(--s1);color:var(--ink);border:1px solid var(--line);border-radius:8px}
+.leaflet-control-zoom,.leaflet-control-attribution{display:none}@media(min-width:761px){.leaflet-control-zoom{display:block}}
+</style></head><body>
+<div id="map"></div>
+<div id="top" class="card"><nav><a href="/">台風DB</a><b>予報比較</b></nav><select id="sel" aria-label="台風"></select><button class="ib" id="rf" aria-label="更新">⟳</button></div>
+<div id="bar" class="card">
+ <div id="chips"></div>
+ <div class="row"><label><input type="checkbox" id="mem" checked>アンサンブルの各メンバー</label><button class="btn" id="tbl">ばらつき表</button></div>
+ <div class="row"><input id="tau" type="range" min="0" max="120" step="6" value="48" aria-label="予報時間"><b id="tv">+48h</b></div>
+ <div id="pos"></div><div id="note"></div>
+</div>
+<dialog id="dlg"></dialog>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const COL={"JMA公式":"#ffffff",UKMET:"#ff8a3d",NAVGEM:"#a78bfa",CMC:"#34d399",GEFS:"#38bdf8","CMC-EPS":"#10b981","NAVGEM-EPS":"#c4b5fd",ECMWF:"#f43f5e",GFS:"#facc15","JMA-GSM":"#f9a8d4","JTWC公式":"#ef4444"};
+const colr=k=>COL[k]||"#94a3b8";
+const map=L.map("map",{zoomControl:false,worldCopyJump:true}).setView([28,140],5);
+L.control.zoom({position:"bottomright"}).addTo(map);
+const ESRI="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/";
+L.tileLayer(ESRI+"World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",{maxZoom:12}).addTo(map);
+map.createPane("labels").style.zIndex=450;map.getPane("labels").style.pointerEvents="none";
+L.tileLayer(ESRI+"World_Dark_Gray_Reference/MapServer/tile/{z}/{y}/{x}",{pane:"labels",maxZoom:12}).addTo(map);
+let items=[],d=null,ref=140;const tm=L.layerGroup().addTo(map),ana=L.layerGroup().addTo(map);
+const w=lo=>lo+360*Math.round((ref-lo)/360);   // 日付変更線をまたいでも線が飛ばないよう経度を連続化
+const fmt=i=>i?`${i.slice(4,6)}/${i.slice(6,8)} ${i.slice(8,10)}Z`:"";
+const at=(p,t)=>{for(let i=0;i<p.length;i++){if(p[i][0]==t)return[p[i][1],w(p[i][2])];
+  if(p[i][0]>t){if(!i)return null;const a=p[i-1],b=p[i],f=(t-a[0])/(b[0]-a[0]);return[a[1]+(b[1]-a[1])*f,w(a[2])+(w(b[2])-w(a[2]))*f]}}return null};
+const line=(g,p,c,o)=>L.polyline(p.map(x=>[x[1],w(x[2])]),{color:c,...o}).addTo(g);
+function add(label,init,pts,o={}){const c=colr(label),g=L.layerGroup();
+  line(g,pts,c,{weight:o.w||3,dashArray:o.dash,opacity:.95});
+  pts.forEach(p=>{if(p[0]&&p[0]%24==0)L.circleMarker([p[1],w(p[2])],{radius:4,color:"#fff",weight:1,fillColor:c,fillOpacity:1})
+    .bindTooltip(`${esc(label)} +${p[0]}h${p[3]?` ${p[3]}kt`:""}`).addTo(g)});
+  const it={label,init,c,g,pts,visible:true};items.push(it);return it}
+function build(){
+  items.forEach(i=>{i.g.remove();i.mem&&i.mem.remove()});items=[];ana.clearLayers();
+  ref=d.analysis?d.analysis.lon:140;
+  if(d.jma)add("JMA公式",d.jma.init,d.jma.pts,{w:4});
+  d.models.forEach(m=>add(m.label,m.init,m.pts));
+  d.ens.forEach(e=>{const it=add(e.label,e.init,e.mean,{dash:"6 5"});it.tag=`${e.n}メンバー`;
+    it.mem=L.layerGroup();e.members.forEach(m=>line(it.mem,m,it.c,{weight:1,opacity:.3}))});
+  if(d.analysis)L.circleMarker([d.analysis.lat,w(d.analysis.lon)],{radius:6,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip("解析位置 "+fmt(d.analysis.init)).addTo(ana);
+  $("#chips").innerHTML=items.map((it,i)=>`<button class="chip" data-i="${i}" style="--c:${it.c}"><i></i>${esc(it.label)}<small>${fmt(it.init)}${it.tag?" "+it.tag:""}</small></button>`).join("");
+  const mx=Math.min(240,Math.max(24,...items.map(i=>i.pts.length?i.pts[i.pts.length-1][0]:0)));
+  $("#tau").max=mx;if(+$("#tau").value>mx)$("#tau").value=48;
+  const have=items.map(i=>i.label),miss=["ECMWF","GFS","JMA-GSM"].filter(x=>!have.includes(x)),u=new Date(d.updated);
+  $("#note").textContent=`取得元: UCAR RAL（ATCF a-deck）${isNaN(u)?"":" 更新 "+u.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}。`+(miss.length?`この取得元に無いモデル: ${miss.join("・")}。`:"")+"予報は参考値です。防災には気象庁の情報を確認してください。";
+  apply();
+  const ll=[];items.forEach(it=>it.pts.forEach(p=>ll.push([p[1],w(p[2])])));if(d.analysis)ll.push([d.analysis.lat,w(d.analysis.lon)]);
+  if(ll.length)map.fitBounds(L.latLngBounds(ll),{paddingTopLeft:[20,70],paddingBottomRight:[20,($("#bar").offsetHeight||200)+20]});
+}
+function apply(){items.forEach(it=>{it.visible?it.g.addTo(map):it.g.remove();
+  if(it.mem)(it.visible&&$("#mem").checked)?it.mem.addTo(map):it.mem.remove()});marks()}
+function marks(){tm.clearLayers();const t=+$("#tau").value,out=[];$("#tv").textContent=`+${t}h`;
+  items.forEach(it=>{if(!it.visible)return;const p=at(it.pts,t);if(!p)return;
+    L.circleMarker(p,{radius:8,color:"#fff",weight:2,fillColor:it.c,fillOpacity:.9,interactive:false}).addTo(tm);
+    out.push(`<span><span style="color:${it.c}">●</span> ${esc(it.label)} ${p[0].toFixed(1)}N ${((p[1]%360+360)%360).toFixed(1)}E</span>`)});
+  $("#pos").innerHTML=out.join("")||"この時間の予報はありません"}
+$("#chips").onclick=e=>{const b=e.target.closest(".chip");if(!b)return;const it=items[+b.dataset.i];it.visible=!it.visible;b.classList.toggle("off",!it.visible);apply()};
+$("#mem").onchange=apply;$("#tau").oninput=marks;
+$("#tbl").onclick=()=>{if(!d)return;const s=d.spread,dl=$("#dlg"),n=v=>v==null?"-":Math.round(v);
+  dl.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b>各時刻の位置のばらつき</b><button class="ib" onclick="$('#dlg').close()" aria-label="閉じる">✕</button></div>
+   <p style="color:var(--sub);font-size:12px">各モデルの予報位置が、全モデルの平均位置から何km離れているか。大きいほどモデル間で意見が割れています。</p>
+   <table><tr><th></th>${s.taus.map(t=>`<th>+${t}h</th>`).join("")}</tr>${s.rows.map(r=>`<tr><td>${esc(r[0])}</td>${r[1].map(v=>`<td>${n(v)}</td>`).join("")}</tr>`).join("")}
+   <tr><td>平均からの最大</td>${s.max.map(v=>`<td><b>${n(v)}</b></td>`).join("")}</tr><tr><td>モデル数</td>${s.n.map(v=>`<td>${v}</td>`).join("")}</tr></table>`;dl.showModal()};
+$("#dlg").addEventListener("click",e=>{if(e.target.id=="dlg")e.target.close()});
+async function load(){const o=$("#sel").selectedOptions[0];if(!o)return;$("#note").textContent="読み込み中…";
+  try{const r=await fetch(`/api/forecast/${o.value}?jma=${o.dataset.jma||""}`);if(!r.ok)throw 0;d=await r.json();build()}
+  catch(e){$("#note").textContent="予報データを取得できませんでした。少し待ってから ⟳ を押してください"}}
+async function init(){$("#note").textContent="台風の一覧を取得中…";
+  try{const r=await fetch("/api/forecast/storms");if(!r.ok)throw 0;const s=await r.json(),keep=$("#sel").value;
+    $("#sel").innerHTML=s.map(x=>`<option value="${esc(x.id)}" data-jma="${esc(x.jma?x.jma.tc:"")}">${esc(x.label)}${x.jma?` ／ 台風${+x.jma.num.slice(2)}号`:""}</option>`).join("");
+    if(!s.length){$("#note").textContent="現在、活動中の西太平洋の台風はありません";return}
+    if(keep&&s.some(x=>x.id==keep))$("#sel").value=keep;load()}
+  catch(e){$("#note").textContent="台風の一覧を取得できませんでした。⟳ で再試行してください"}}
+$("#sel").onchange=load;$("#rf").onclick=init;init();
+if("serviceWorker" in navigator)addEventListener("load",()=>navigator.serviceWorker.register("/sw.js").catch(()=>{}));
+</script></body></html>
+"""
+
+@app.get("/forecast", response_class=HTMLResponse)
+def forecast_page():
+    return FPAGE
+
 # ---------------- 画面 ----------------
 PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -784,8 +1006,8 @@ dialog::backdrop{background:#000b}dialog h2{margin:0;font-size:17px}dialog h3{ma
     <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="name">名前順</option></select>
     <button type="button" id="dir" title="昇順・降順">↓</button><input type="hidden" name="order" value="desc"></div>
-   <div class="chips wide"><button type="button" class="chip t" id="tNear">📍 現在地から</button><button type="button" class="chip t" id="tPick">📌 地図で指定</button>
-    <button type="button" class="chip t" id="tAll">🗺 重ねて表示</button><button type="button" class="chip t" id="tStat">📊 統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
+   <div class="chips wide"><a class="chip t" href="/forecast" style="display:inline-flex;align-items:center;text-decoration:none;color:inherit">予報比較</a><button type="button" class="chip t" id="tNear">現在地から</button><button type="button" class="chip t" id="tPick">地図で指定</button>
+    <button type="button" class="chip t" id="tAll">重ねて表示</button><button type="button" class="chip t" id="tStat">統計</button><button type="button" class="chip t" id="tCsv">⤓ CSV</button></div>
    <details><summary>詳細条件</summary><div class="f2">
     <label>年（から）<select name="year_from"><option value="">指定なし</option></select></label>
     <label>年（まで）<select name="year_to"><option value="">指定なし</option></select></label>
