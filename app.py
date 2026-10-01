@@ -7,7 +7,8 @@
 今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）＋デジタル台風（NII、PDF未掲載の消滅済み台風の補完）で随時更新する。
 データ出典: 気象庁 / IBTrACS / デジタル台風（国立情報学研究所・北本朗）
 画面: 1ページ・地図共有の3タブ構成（予報 / 過去の台風 / 統計）。旧 /forecast は /#fc へ転送。
-強風域・暴風域（気象庁ベストトラックの半径。IBTrACS由来の台風のみ）は radii テーブルに保存し、過去の台風タブで表示を切り替える。
+強風域・暴風域（気象庁の半径）は radii テーブルに保存し、過去の台風タブで表示する（既定ON）。
+  過去の台風は IBTrACS（ベストトラック）、今年の台風は位置表PDF（速報・確定）と防災情報JSONの実況から取り込む。予報には付けない。
 めずらしい台風（復活・越境・ループ・急発達）と移動距離は、各台風の点列から自動判定して feat テーブルに保存する。
   判定結果の確認:  python app.py featdiag
 """
@@ -67,6 +68,56 @@ def rad_of(r):
         else:
             out += [None, None, None]
     return tuple(out) if out[1] or out[4] else None
+
+# ---- 半径（位置表PDF・防災情報JSON用）。radii テーブルは (向き, 長径, 短径) を海里で持つ ----
+NM = 1.852
+DIR8 = {"NE": 1, "E": 2, "SE": 3, "S": 4, "SW": 5, "W": 6, "NW": 7, "N": 8}
+JDIR8 = {"北東": 1, "東": 2, "南東": 3, "南": 4, "南西": 5, "西": 6, "北西": 7, "北": 8}
+_SPEC = r"(---|[NSEW]{1,2}:\s*\d+(?:\s+[NSEW]{1,2}:\s*\d+)?|\d+)"  # 位置表の「暴風域半径」「強風域半径」の1列ぶん
+RAD_COLS = re.compile(r"^\s*" + _SPEC + r"\s+" + _SPEC)
+
+def _pair_area(pr):
+    """[(向きコード or None, 半径km), ...] → (向き, 長径km, 短径km)。半径が1つだけ・向き不明なら全方向の円(9)。"""
+    pr = sorted((x for x in pr if x[1] and x[1] > 0), key=lambda x: -x[1])
+    if not pr:
+        return None
+    if len(pr) == 1 or pr[0][0] is None:
+        return (9, pr[0][1], pr[0][1])
+    return (pr[0][0], pr[0][1], pr[1][1])
+
+def _rad_km(storm, gale):
+    """(暴風域, 強風域) = 各 (向き, 長径km, 短径km) or None → radii 行の値（半径は海里）。どちらも無ければ None。"""
+    if not storm and not gale:
+        return None
+    out = []
+    for a in (storm, gale):
+        out += [a[0], a[1] / NM, a[2] / NM] if a else [None, None, None]
+    return tuple(out)
+
+def _text_area(sp):
+    sp = sp.strip()
+    if sp.startswith("-"):
+        return None
+    if sp.isdigit():
+        return _pair_area([(None, int(sp))])
+    return _pair_area([(DIR8.get(d), int(v)) for d, v in re.findall(r"([NSEW]{1,2}):\s*(\d+)", sp)])
+
+def rad_from_text(rest):
+    """位置表PDFの1行の風速より右側（例 ' 85  E: 300 W: 165  － 強い'）→ radii 行の値。無ければ None。
+    列は 暴風域半径(km)・強風域半径(km)。'---'=無し、数字1つ=円、'E: 300 W: 165'=長い側と短い側。"""
+    m = RAD_COLS.match(rest)
+    return _rad_km(_text_area(m[1]), _text_area(m[2])) if m else None
+
+def ensure_radii(con):
+    con.execute("CREATE TABLE IF NOT EXISTS radii(sid TEXT, time TEXT, d50 INT, l50 REAL, s50 REAL, d30 INT, l30 REAL, s30 REAL)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_radii_sid ON radii(sid)")
+
+def set_radii(con, sid, rads, upto):
+    """位置表PDFの半径で、PDFの最終時刻までの分を置き換える（PDFより新しい実況の半径は残す）。"""
+    ensure_radii(con)
+    con.execute("DELETE FROM radii WHERE sid=? AND time<=?", (sid, upto))
+    if rads:
+        con.executemany("INSERT INTO radii VALUES(?,?,?,?,?,?,?,?)", [(sid, *x) for x in rads])
 
 def jst(iso):
     return datetime.strptime(iso[:19], "%Y-%m-%d %H:%M:%S") + timedelta(hours=9)
@@ -171,15 +222,16 @@ HEAD = re.compile(r"(\d{4})年台風第\s*(\d+)号\s+([A-Za-z][A-Za-z\-]*)")
 ROW = re.compile(r"^(?:(\d{1,2})\s+)?(?:(\d{1,2})\s+)?(\d{1,2})\s+(\d+\.\d)(?:\s+N)?\s+(\d+\.\d)(?:\s+E)?\s+(\d{3,4}|--)\s+(\d{1,2}|--)(?=\s|$)")
 
 def parse_pdf(text):
-    """気象庁の台風位置表PDF（日本時・風速m/s）→ (年, 号数, 名前, 点列(UTC・kt), 速報か)"""
+    """気象庁の台風位置表PDF（日本時・風速m/s）→ (年, 号数, 名前, 点列(UTC・kt), 速報か, 半径行[(時刻UTC, 暴風域3つ, 強風域3つ)])"""
     h = HEAD.search(text)
     if not h:
         return None
     year, no, name = int(h[1]), int(h[2]), h[3].upper()
     y0 = year  # 号数の年（年またぎでも変えない）
-    mo = da = None; pts = []
+    mo = da = None; pts = []; rads = []
     for ln in text.splitlines():
-        r = ROW.match(ln.strip())
+        ln = ln.strip()
+        r = ROW.match(ln)
         if not r:
             continue
         ints = [int(x) for x in r.groups()[:3] if x]
@@ -196,7 +248,10 @@ def parse_pdf(text):
         pres = None if r[6] == "--" else float(r[6])
         wind = None if r[7] == "--" else round(int(r[7]) * MS2KT)  # m/s→kt
         pts.append((t.strftime(F), float(r[4]), float(r[5]), wind, pres))
-    return (y0, no, name, pts, "速報値" in text) if pts else None
+        rd = rad_from_text(ln[r.end():])
+        if rd:
+            rads.append((t.strftime(F), *rd))
+    return (y0, no, name, pts, "速報値" in text, rads) if pts else None
 
 def fetch_pdf(c, since=None):
     """位置表PDFを取得して解析。戻り値: (コード, 解析結果 or None, Last-Modified)。
@@ -227,16 +282,21 @@ def refresh_pdf(con, yr):
     codes = sorted({c for c in re.findall(r"T(\d{4})\.pdf", html) if c[:2] == yy})
     top = int(codes[-1][2:]) if codes else 0
     codes += [f"{yy}{n:02d}" for n in range(top + 1, top + 6)]  # 一覧の掲載は遅れるので先の号も探す(404は無視)
+    ensure_radii(con)
     done = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%' AND prov=0")}
     have = {r[0] for r in con.execute("SELECT sid FROM typhoons WHERE sid LIKE 'JMA%'")}
     lm = dict(con.execute("SELECT k, v FROM meta WHERE k LIKE 'lm:%'"))
-    todo = [c for c in codes if f"JMA{c}" not in done]
-    since = lambda c: lm.get(f"lm:{c}") if f"JMA{c}" in have else None
+    rb = {r[0][3:] for r in con.execute("SELECT k FROM meta WHERE k LIKE 'rb:%'")}  # 半径を取り込み済みの台風
+    bf = {x for x in have if x not in rb}  # 半径対応前に取り込んだ台風は、確定済み・変更なしでも一度だけ取り直す
+    todo = [c for c in codes if f"JMA{c}" not in done or f"JMA{c}" in bf]
+    since = lambda c: lm.get(f"lm:{c}") if (f"JMA{c}" in have and f"JMA{c}" not in bf) else None
     with ThreadPoolExecutor(4) as ex:
         got = [g for g in ex.map(lambda c: fetch_pdf(c, since(c)), todo) if g[1]]
-    for c, (y, no, en, pts, prov), mod in got:
+    for c, (y, no, en, pts, prov, rads), mod in got:
         con.execute("DELETE FROM points WHERE sid=?", (f"JMA{c}",))
         insert(con, f"JMA{c}", y, no, en, pts, int(prov))
+        set_radii(con, f"JMA{c}", rads, pts[-1][0])
+        con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"rb:JMA{c}", "1"))
         if mod:
             con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"lm:{c}", mod))
         con.execute("DELETE FROM meta WHERE k=?", (f"dt:JMA{c}",))  # 位置表PDFが載ったのでDT補完は不要
@@ -365,6 +425,54 @@ def live_point(spec, fc=()):
             break
     return (en, pt, past) if pt else None
 
+def _warn_area(w):
+    """防災情報JSONの stormWarning / galeWarning → (向き, 長径km, 短径km)。形が想定と違えば None。"""
+    if not isinstance(w, dict):
+        return None
+    areas = w.get("areas")
+    if not isinstance(areas, list):
+        areas = [w] if ("radius" in w or "range" in w) else []
+    pr = []
+    for a in areas:
+        if not isinstance(a, dict):
+            continue
+        rd = a.get("radius", a.get("range"))
+        if isinstance(rd, dict):
+            km = num(rd.get("km"))
+            if km is None:
+                nm = num(rd.get("nm"))
+                km = nm * NM if nm else None
+        else:
+            km = num(rd)
+        d = a.get("direction") or a.get("dir")
+        if isinstance(d, dict):
+            d = d.get("en") or d.get("jp")
+        d = str(d or "").strip()
+        pr.append((DIR8.get(d.upper()) or JDIR8.get(d), km))
+    return _pair_area(pr)
+
+def live_radii(spec):
+    """発生中の台風の実況 → (時刻UTC, 半径の値)。実況に半径が無い・読めなければ None。"""
+    for r in spec:
+        p = r.get("part") if isinstance(r, dict) else None
+        if isinstance(p, dict) and p.get("jp") == "実況":
+            try:
+                t = datetime.strptime(r["validtime"]["UTC"][:19], "%Y-%m-%dT%H:%M:%S").strftime(F)
+            except (KeyError, TypeError, ValueError):
+                return None
+            storm = gale = None
+            for k, v in r.items():
+                kl = str(k).lower()
+                if "storm" in kl:
+                    storm = _warn_area(v)
+                elif "gale" in kl:
+                    gale = _warn_area(v)
+            rd = _rad_km(storm, gale)
+            if rd is None:
+                print("live radii: 半径を読み取れません keys =", sorted(r.keys()), flush=True)
+            return (t, rd) if rd else None
+    return None
+
 def merge_live(con, sid, year, no, en, pt, past=()):
     """発生中の台風の実況を取り込む。
     ・時刻が確かな点（位置表PDF・デジタル台風・過去の実況）を土台にする。無ければ同名のIBTrACS由来の点
@@ -414,6 +522,11 @@ def refresh_live(con):
                 continue
             en, pt, past = got
             n += merge_live(con, f"JMA{tn}", 2000 + int(tn[:2]), int(tn[2:]), en, pt, past)
+            rr = live_radii(spec)  # 実況の強風域・暴風域（その時刻の1行。更新のたびに積み上がる）
+            if rr:
+                ensure_radii(con)
+                con.execute("DELETE FROM radii WHERE sid=? AND time=?", (f"JMA{tn}", rr[0]))
+                con.execute("INSERT INTO radii VALUES(?,?,?,?,?,?,?,?)", (f"JMA{tn}", rr[0], *rr[1]))
         except Exception as e:
             print(f"live {tc} failed:", repr(e), flush=True)
     print(f"JMA live: {n} updated", flush=True)
@@ -1522,6 +1635,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 <dialog id="dlg"></dialog>
 <div id="toast"></div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/polygon-clipping@0.15.7/dist/polygon-clipping.umd.min.js"></script>
 <script>
 // ================= 共通 =================
 const TABS={fc:"予報",db:"過去の台風",st:"統計"};
@@ -1604,25 +1718,43 @@ const km=(a,b)=>{const r=Math.PI/180,dl=(b[1]-a[1])*r,p1=a[0]*r,p2=b[0]*r;
   return 6371*Math.acos(Math.min(1,Math.sin(p1)*Math.sin(p2)+Math.cos(p1)*Math.cos(p2)*Math.cos(dl)))};
 const layer=L.layerGroup(),nearL=L.layerGroup(),ovL=L.layerGroup();dbLayerList.push(layer,nearL,ovL);
 map.createPane("ov").style.zIndex=380;
-// 強風域・暴風域（気象庁ベストトラックの半径。データがある台風・時刻だけ）
+// 強風域・暴風域（気象庁の半径。データがある台風・時刻だけ）。軌跡に沿って1つの帯につなげて描く
 map.createPane("wz").style.zIndex=375;
 const wzL=L.layerGroup(),wzN=L.layerGroup();dbLayerList.push(wzL,wzN);
-const wz={r50:false,r30:false},WZC={r50:"#fb7185",r30:"#fbbf24"},WZN={r50:"暴風域",r30:"強風域"};
+const wz={r50:true,r30:true},WZC={r50:"#fb7185",r30:"#fbbf24"},WZN={r50:"暴風域",r30:"強風域"},WZF={r50:.2,r30:.11};   // 既定ON
 const BR=[null,45,90,135,180,225,270,315,0];   // 向きコード 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW 8=N（0・9=円）
-// 長径の向きに最大半径、反対側に最小半径になるよう、方位ごとの半径をなめらかにつないだ形（簡易形状）
+const wzMP=L.Projection.SphericalMercator,
+  wzM=p=>{const q=wzMP.project(L.latLng(p[0],p[1]));return [q.x,q.y]},
+  wzU=p=>{const q=wzMP.unproject(L.point(p[0],p[1]));return [q.lat,q.lng]};
+function wzDest(la,lo,b,km){const R=Math.PI/180,d=km/6371,t=b*R,p1=la*R,p2=Math.asin(Math.sin(p1)*Math.cos(d)+Math.cos(p1)*Math.sin(d)*Math.cos(t)),
+  dl=Math.atan2(Math.sin(t)*Math.sin(d)*Math.cos(p1),Math.cos(d)-Math.sin(p1)*Math.sin(p2));return [p2/R,lo+dl/R]}
+// 気象庁の定義どおり: 長径方向に(長径-短径)/2ずらした点を中心に、半径(長径+短径)/2の円
 function wzShape(la,lo,r,k){const o=k=="r50"?0:3,lg=r[o+1];if(!lg)return null;
-  const sh=r[o+2]||lg,b0=BR[r[o]],R=Math.PI/180,p1=la*R,g=[];
-  for(let a=0;a<360;a+=10){const rr=b0==null?lg:sh+(lg-sh)*(1+Math.cos((a-b0)*R))/2,d=rr/6371,t=a*R,
-      p2=Math.asin(Math.sin(p1)*Math.cos(d)+Math.cos(p1)*Math.sin(d)*Math.cos(t)),
-      dl=Math.atan2(Math.sin(t)*Math.sin(d)*Math.cos(p1),Math.cos(d)-Math.sin(p1)*Math.sin(p2));
-    g.push([p2/R,lo+dl/R])}
-  return g}
+  const sh=Math.min(r[o+2]||lg,lg),b0=BR[r[o]];let c=[la,lo],rad=lg;
+  if(b0!=null&&sh<lg){c=wzDest(la,lo,b0,(lg-sh)/2);rad=(lg+sh)/2}
+  const g=[];for(let a=0;a<360;a+=10)g.push(wzDest(c[0],c[1],a,rad));return g}
+function wzHull(P){P=P.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);const cr=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lo=[],up=[];for(const p of P){while(lo.length>1&&cr(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p)}
+  for(const p of P.slice().reverse()){while(up.length>1&&cr(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p)}
+  lo.pop();up.pop();return lo.concat(up)}
+const wzArea=P=>P.reduce((s,a,i)=>{const b=P[(i+1)%P.length];return s+a[0]*b[1]-b[0]*a[1]},0);
+// 各時刻の形と、隣り合う時刻どうしの凸包を重ねて1つの外形にする（12時間より空いた所はつなげない）
+function wzBand(k){if(cur.wzc[k])return cur.wzc[k];
+  const T=cur.pts.map(p=>new Date(p.time.replace(" ","T")+"Z").getTime()),
+    m=cur.pts.map((p,i)=>p.r?(wzShape(cur.ll[i][0],cur.ll[i][1],p.r,k)||[]).map(wzM):[]),polys=[];
+  m.forEach((s,i)=>{if(!s.length)return;const a=m[i-1];
+    polys.push([a&&a.length&&T[i]-T[i-1]<=12*36e5?wzHull(a.concat(s)):s])});
+  let g=null,fb=false;
+  if(polys.length){
+    try{if(window.polygonClipping)g=polygonClipping.union(...polys).map(pg=>pg.map(rg=>rg.map(wzU)))}catch(e){g=null}
+    if(!g){fb=true;g=polys.map(pg=>[(wzArea(pg[0])<0?pg[0].slice().reverse():pg[0]).map(wzU)])}}   // ライブラリが読めない時は枠線なしで重ねる
+  return cur.wzc[k]={g:g||[],fb}}
 function drawWz(){wzL.clearLayers();if(!cur)return;
-  cur.pts.forEach((p,i)=>{if(!p.r)return;["r30","r50"].forEach(k=>{if(!wz[k])return;const g=wzShape(cur.ll[i][0],cur.ll[i][1],p.r,k);
-    if(g)L.polygon(g,{pane:"wz",stroke:false,fillColor:WZC[k],fillOpacity:.07,interactive:false}).addTo(wzL)})})}
+  ["r30","r50"].forEach(k=>{if(!wz[k])return;const b=wzBand(k);if(!b.g.length)return;
+    L.polygon(b.g,{pane:"wz",stroke:!b.fb,color:WZC[k],weight:1.6,opacity:.9,lineJoin:"round",fillColor:WZC[k],fillOpacity:WZF[k],fillRule:"nonzero",interactive:false}).addTo(wzL)})}
 function drawWzNow(){wzN.clearLayers();if(!cur)return;const p=cur.pts[cur.i];if(!p||!p.r)return;
   ["r30","r50"].forEach(k=>{if(!wz[k])return;const g=wzShape(cur.ll[cur.i][0],cur.ll[cur.i][1],p.r,k);
-    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2,fillColor:WZC[k],fillOpacity:.14,interactive:false}).addTo(wzN)})}
+    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",fillColor:WZC[k],fillOpacity:.16,interactive:false}).addTo(wzN)})}
 let first=true,cur=null,playT=null,near=null,pick=false,ovOn=false,lastP=new URLSearchParams();
 
 // 一覧パネル（スマホ: 下から出るシート）
@@ -1734,9 +1866,9 @@ async function show(sid,li,keep){
   const dist=Math.round((t.dist!=null?t.dist:ll.slice(1).reduce((s,p,i)=>s+km(ll[i],p),0))/10)*10;
   const spdv=dist&&t.days>0?Math.round(dist/(t.days*24)):"-";
   const wzh=t.has_r?`<div class="wzs"><button type="button" class="chip${wz.r50?" on":""}" data-wz="r50" style="--c:${WZC.r50}"><i></i>暴風域（25m/s以上）</button><button type="button" class="chip${wz.r30?" on":""}" data-wz="r30" style="--c:${WZC.r30}"><i></i>強風域（15m/s以上）</button></div>
-   <div class="note" style="margin-top:4px">気象庁ベストトラックの半径から作図（データのある時刻のみ・簡易形状）。ONにすると軌跡に沿った範囲を重ね、今の位置は枠線で強調します。</div>`:"";
+   <div class="note" style="margin-top:4px">気象庁の半径から作図（データのある時刻のみ）。軌跡に沿って影響範囲を1つの帯につなげて表示し、今の位置は破線で強調します。</div>`:"";
   const tgl=(t.tg||[]).length?`<div class="tgs">${t.tg.map(k=>`<span class="tgp k-${k}" title="${esc(TGD[k])}">${esc(tgTxt(k,t))}</span>`).join("")}</div>`:"";
-  cur={pts,ll,xs,i:0,bounds:L.latLngBounds(ll),mk:L.circleMarker(ll[0],{radius:9,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:.9,interactive:false}).addTo(layer)};
+  cur={pts,ll,xs,i:0,wzc:{},bounds:L.latLngBounds(ll),mk:L.circleMarker(ll[0],{radius:9,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:.9,interactive:false}).addTo(layer)};
   const i=$("#info");i.hidden=false;
   i.innerHTML=`<div class="hd"><h2>${esc(t.title)}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2><button type="button" class="btn sm" data-a="close">閉じる</button></div>
    <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）${dist?` ・ 約${dist.toLocaleString()}km`:""}</div>
