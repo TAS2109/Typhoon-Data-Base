@@ -1732,18 +1732,33 @@ function wzDest(la,lo,b,km){const R=Math.PI/180,d=km/6371,t=b*R,p1=la*R,p2=Math.
 function wzShape(la,lo,r,k){const o=k=="r50"?0:3,lg=r[o+1];if(!lg)return null;
   const sh=Math.min(r[o+2]||lg,lg),b0=BR[r[o]];let c=[la,lo],rad=lg;
   if(b0!=null&&sh<lg){c=wzDest(la,lo,b0,(lg-sh)/2);rad=(lg+sh)/2}
-  const g=[];for(let a=0;a<360;a+=10)g.push(wzDest(c[0],c[1],a,rad));return g}
+  const g=[];for(let a=0;a<360;a+=5)g.push(wzDest(c[0],c[1],a,rad));return g}
 function wzHull(P){P=P.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);const cr=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
   const lo=[],up=[];for(const p of P){while(lo.length>1&&cr(lo[lo.length-2],lo[lo.length-1],p)<=0)lo.pop();lo.push(p)}
   for(const p of P.slice().reverse()){while(up.length>1&&cr(up[up.length-2],up[up.length-1],p)<=0)up.pop();up.push(p)}
   lo.pop();up.pop();return lo.concat(up)}
 const wzArea=P=>P.reduce((s,a,i)=>{const b=P[(i+1)%P.length];return s+a[0]*b[1]-b[0]*a[1]},0);
-// 各時刻の形と、隣り合う時刻どうしの凸包を重ねて1つの外形にする（12時間より空いた所はつなげない）
+// 帯の外形: 各時刻の形を「円（中心のずれ＋半径）」にし、時刻の並びに沿って軽くなめらかにしてから、
+// 隣り合う円どうしの凸包（=外接線でつないだ形）を重ねて1つの外形にする。
+// 半径が観測ごとに増減しても、境界が波打たない（描画用の平滑化。今の位置の破線は観測値そのまま）。12時間より空いた所はつなげない
+function wzCirc(c,rad,st){const g=[];for(let a=0;a<360;a+=st)g.push(wzDest(c[0],c[1],a,rad));return g}
 function wzBand(k){if(cur.wzc[k])return cur.wzc[k];
-  const T=cur.pts.map(p=>new Date(p.time.replace(" ","T")+"Z").getTime()),
-    m=cur.pts.map((p,i)=>p.r?(wzShape(cur.ll[i][0],cur.ll[i][1],p.r,k)||[]).map(wzM):[]),polys=[];
-  m.forEach((s,i)=>{if(!s.length)return;const a=m[i-1];
-    polys.push([a&&a.length&&T[i]-T[i-1]<=12*36e5?wzHull(a.concat(s)):s])});
+  const o=k=="r50"?0:3,R=Math.PI/180,
+    T=cur.pts.map(p=>new Date(p.time.replace(" ","T")+"Z").getTime()),
+    it=cur.pts.map((p,i)=>{const r=p.r,lg=r&&r[o+1];if(!lg)return null;
+      const sh=Math.min(r[o+2]||lg,lg),b0=BR[r[o]],d=b0!=null&&sh<lg?(lg-sh)/2:0;
+      return {i,ex:d*Math.sin((b0||0)*R),ny:d*Math.cos((b0||0)*R),rad:b0!=null&&sh<lg?(lg+sh)/2:lg}}),
+    polys=[];
+  for(let s=0;s<it.length;){if(!it[s]){s++;continue}
+    let e=s;while(e+1<it.length&&it[e+1]&&T[e+1]-T[e]<=12*36e5)e++;
+    const run=it.slice(s,e+1);
+    for(let n=0;n<3;n++){const q=run.map(x=>({...x}));   // [1,2,1]/4 を3回（両端は観測値のまま）
+      for(let j=1;j<run.length-1;j++)for(const f of["ex","ny","rad"])q[j][f]=(run[j-1][f]+2*run[j][f]+run[j+1][f])/4;
+      q.forEach((x,j)=>run[j]=x)}
+    const cs=run.map(x=>{const la=cur.ll[x.i][0],lo=cur.ll[x.i][1],d=Math.hypot(x.ex,x.ny),
+      c=d>1e-6?wzDest(la,lo,Math.atan2(x.ex,x.ny)/R,d):[la,lo];return wzCirc(c,x.rad,5).map(wzM)});
+    cs.forEach((g,j)=>polys.push([j?wzHull(cs[j-1].concat(g)):g]));
+    s=e+1}
   let g=null,fb=false;
   if(polys.length){
     try{if(window.polygonClipping)g=polygonClipping.union(...polys).map(pg=>pg.map(rg=>rg.map(wzU)))}catch(e){g=null}
