@@ -221,9 +221,73 @@ def refresh_pdf(con, yr):
         if mod:
             con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"lm:{c}", mod))
         con.execute("DELETE FROM meta WHERE k=?", (f"dt:JMA{c}",))  # 位置表PDFが載ったのでDT補完は不要
+        _est_set(con, f"JMA{c}", set())
     print(f"JMA {yr}: PDF {len(got)}/{len(todo)} updated", flush=True)
 
 TRACK_STEP_H = float(os.environ.get("TRACK_STEP_H", "3"))  # forecast.json の過去軌跡の点間隔（時間）。時刻は推定値
+TRACK_MATCH_KM = float(os.environ.get("TRACK_MATCH_KM", "150"))  # 過去軌跡と実データの最初の点を「同じ場所」とみなす距離
+
+def _est_get(con, sid):
+    """時刻が推定値の点（過去軌跡由来）の時刻一覧。推定点は実データと区別して、毎回作り直す。"""
+    r = con.execute("SELECT v FROM meta WHERE k=?", (f"est:{sid}",)).fetchone()
+    try:
+        return set(json.loads(r[0])) if r else set()
+    except (TypeError, ValueError):
+        return set()
+
+def _est_set(con, sid, times):
+    if times:
+        con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"est:{sid}", json.dumps(sorted(times))))
+    else:
+        con.execute("DELETE FROM meta WHERE k=?", (f"est:{sid}",))
+
+def tidy(p):
+    """点列を時刻順にそろえる。同時刻の点は風速・気圧が入っている方を残し、
+    前後の点と大きく食い違う孤立した1点（別ソース混在による位置の飛び）は捨てる。"""
+    by = {}
+    for x in sorted(p, key=lambda x: x[0]):
+        o = by.get(x[0])
+        if o is None or ((x[3] is not None or x[4] is not None) and o[3] is None and o[4] is None):
+            by[x[0]] = x
+    out = [by[k] for k in sorted(by)]
+    i = 1
+    while 0 < i < len(out) - 1:
+        a, b, c = out[i - 1], out[i], out[i + 1]
+        d1, d2 = _gc(a[1], a[2], b[1], b[2]), _gc(b[1], b[2], c[1], c[2])
+        if min(d1, d2) > 400 and _gc(a[1], a[2], c[1], c[2]) < min(d1, d2) / 2:
+            del out[i]
+            continue
+        i += 1
+    return out
+
+def est_back(real, trk):
+    """forecast.json の過去軌跡（時刻なし）から、実データより前の部分だけを推定点として作る。
+    軌跡上で実データの最初の点と同じ場所の点を探し、その手前だけを使う（時刻はそこから TRACK_STEP_H 時間刻みで遡る）。
+    同じ場所が見つからなければ作らない。→ 実データの期間と重なって位置が行き戻りすることがない。"""
+    if not real or not trk:
+        return []
+    la0, lo0 = real[0][1], real[0][2]
+    j, d = min(((i, _gc(la, lo, la0, lo0)) for i, (la, lo) in enumerate(trk)), key=lambda x: x[1])
+    if d > TRACK_MATCH_KM or j == 0:
+        return []
+    t0 = datetime.strptime(real[0][0][:19], F)
+    return [((t0 - timedelta(hours=TRACK_STEP_H * (j - i))).strftime(F), la, lo, None, None)
+            for i, (la, lo) in enumerate(trk[:j])]
+
+def repair_once(con):
+    """旧版は推定時刻つきの点を普通の点として保存していたため、DT・位置表が載った後も残って
+    『進んだのに元の場所へ戻る』原因になった。速報扱いの台風から、その点（風速・気圧とも無い点）を一度だけ取り除く。"""
+    if con.execute("SELECT 1 FROM meta WHERE k='trk_fix'").fetchone():
+        return
+    sel = "SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time"
+    for sid, yr, no, en in con.execute("SELECT sid, year, number, name_en FROM typhoons WHERE sid LIKE 'JMA%' AND prov=1").fetchall():
+        pts = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
+        keep = [p for i, p in enumerate(pts) if p[3] is not None or p[4] is not None or i == len(pts) - 1]
+        if keep and len(keep) != len(pts):
+            con.execute("DELETE FROM points WHERE sid=?", (sid,))
+            insert(con, sid, yr, no, en, keep, 1)
+        con.execute("DELETE FROM meta WHERE k=?", (f"lm:{sid[3:]}",))  # 位置表PDFを取り直す
+    con.execute("INSERT OR REPLACE INTO meta VALUES('trk_fix','1')")
 
 def get_json(url, default=None):
     try:
@@ -284,32 +348,29 @@ def live_point(spec, fc=()):
 
 def merge_live(con, sid, year, no, en, pt, past=()):
     """発生中の台風の実況を取り込む。
-    ・位置表PDF由来の点（無ければ同名のIBTrACS由来の点）があれば、それを土台にする
-    ・土台より古い側は、forecast.json の過去軌跡で補う（軌跡は時刻を持たないので、実況時刻から
-      TRACK_STEP_H 時間刻みで遡った推定時刻。位置表PDFが載れば、そちらの正しい値で置き換わる）
+    ・時刻が確かな点（位置表PDF・デジタル台風・過去の実況）を土台にする。無ければ同名のIBTrACS由来の点
     ・最新の実況1点を末尾に追記する
+    ・forecast.json の過去軌跡は時刻を持たないので、土台の最初の点より前の部分だけを推定点として補う。
+      推定点は est: に記録し、毎回捨てて作り直す（位置表PDF・デジタル台風が載れば、そちらの確かな値で置き換わる）
     戻り値: 更新したか。"""
     sel = "SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time"
-    old = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
-    if not old and en:
+    cur = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
+    est = _est_get(con, sid)
+    real = [p for p in cur if p[0] not in est]
+    if not real and en:
         alt = con.execute("SELECT sid FROM typhoons WHERE year=? AND name_en=? AND sid NOT LIKE 'JMA%'",
                           (year, en)).fetchone()
         if alt:
-            old = [tuple(p) for p in con.execute(sel, (alt[0],)).fetchall()]
-    trk = list(past)
-    if trk and abs(trk[-1][0] - pt[1]) < 0.05 and abs(trk[-1][1] - pt[2]) < 0.05:
-        trk.pop()  # 末尾が実況と同じ点なら重複させない
-    t1 = datetime.strptime(pt[0][:19], F)
-    back = [((t1 - timedelta(hours=TRACK_STEP_H * (len(trk) - i))).strftime(F), la, lo, None, None)
-            for i, (la, lo) in enumerate(trk)]
-    first = old[0][0] if old else pt[0]
-    new = [b for b in back if b[0] < first] + old
-    if not old or old[-1][0] < pt[0]:
-        new.append(pt)
-    if new == old:
+            real = [tuple(p) for p in con.execute(sel, (alt[0],)).fetchall()]
+    if not real or real[-1][0] < pt[0]:
+        real.append(pt)
+    back = est_back(real, list(past))
+    new = tidy(back + real)
+    if new == cur:
         return False
     con.execute("DELETE FROM points WHERE sid=?", (sid,))
     insert(con, sid, year, no, en, new, 1)
+    _est_set(con, sid, {b[0] for b in back})
     return True
 
 def refresh_live(con):
@@ -376,12 +437,15 @@ def refresh_dt(con, yr):
             continue
         en, pts = g
         sid = f"JMA{yy}{n:02d}"
-        old = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
-        new = pts + [p for p in old if p[0] > pts[-1][0]]  # 防災情報JSONの実況がDTより新しければ残す
+        cur = [tuple(p) for p in con.execute(sel, (sid,)).fetchall()]
+        est = _est_get(con, sid)
+        old = [p for p in cur if p[0] not in est]  # 推定時刻の点はここで捨てる（残すと位置が行き戻りする）
+        new = tidy(pts + [p for p in old if p[0] > pts[-1][0]])  # 防災情報JSONの実況がDTより新しければ残す
         con.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (f"dt:{sid}", pts[-1][0]))
-        if new != old:
+        if new != cur:
             con.execute("DELETE FROM points WHERE sid=?", (sid,))
             insert(con, sid, yr, n, en, new, 1)
+            _est_set(con, sid, set())
             upd += 1
     print(f"DT {yr}: {len(todo)} target, {upd} updated", flush=True)
 
@@ -540,6 +604,10 @@ def refresh_recent():
     con, ok = None, False
     try:
         con = sqlite3.connect(DB, timeout=60)
+        try:
+            repair_once(con)
+        except Exception as e:
+            print("repair_once failed:", repr(e), flush=True)
         now = datetime.now(timezone(timedelta(hours=9)))
         for yr in [now.year] + ([now.year - 1] if now.month == 1 else []):  # 1月は前年の台風も継続しうる
             try:
@@ -1382,7 +1450,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
     <div class="chips wide">
      <button type="button" class="chip" data-w="">全ての強さ</button><button type="button" class="chip" data-w="33">強い〜</button>
      <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
-    <div class="chips wide" id="tgChips" aria-label="めずらしい台風"><span class="chl">めずらしい</span><button type="button" class="chip" data-tg="rev">復活台風</button><button type="button" class="chip" data-tg="cin">越境台風</button><button type="button" class="chip" data-tg="cout">180度の東へ</button><button type="button" class="chip" data-tg="lp">迷走(ループ)</button><button type="button" class="chip" data-tg="ri">急発達</button></div>
+    <div class="chips wide" id="tgChips" aria-label="特徴で絞り込み"><button type="button" class="chip" data-tg="rev">復活台風</button><button type="button" class="chip" data-tg="cin">越境台風</button><button type="button" class="chip" data-tg="cout">180度の東へ</button><button type="button" class="chip" data-tg="lp">迷走(ループ)</button><button type="button" class="chip" data-tg="ri">急発達</button></div>
     <div class="note wide" id="tgNote" hidden></div>
     <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="dist">移動距離順</option><option value="name">名前順</option></select>
      <button type="button" id="dir" title="昇順・降順">降順</button><input type="hidden" name="order" value="desc"></div>
@@ -1708,7 +1776,14 @@ const tm=L.layerGroup(),ana=L.layerGroup();
 let items=[],d=null,ref=140,ready=false,active=false,met="w",fitFor="";
 const opt={step:24,inlay:true,num:false};
 const w=lo=>lo+360*Math.round((ref-lo)/360);   // 日付変更線をまたいでも線が飛ばないよう経度を連続化
-const fmt=i=>i?`${i.slice(4,6)}/${i.slice(6,8)} ${i.slice(8,10)}Z`:"";
+// 予報の時刻は全て日本時間(JST)で表示する。初期時刻は YYYYMMDDHH（UTC）で届く
+const iso=i=>Date.UTC(+i.slice(0,4),+i.slice(4,6)-1,+i.slice(6,8),+i.slice(8,10));
+const J=ms=>{const x=new Date(ms+9*3600e3);return `${x.getUTCMonth()+1}/${x.getUTCDate()} ${String(x.getUTCHours()).padStart(2,"0")}時`};
+const fmt=i=>i?J(iso(i)):"";                      // 初期時刻（日本時間）
+const vt=(i,h)=>i?J(iso(i)+h*3600e3):"";          // 初期時刻のh時間後（日本時間）
+const vd=(i,h)=>{if(!i)return"";const x=new Date(iso(i)+h*3600e3+9*3600e3);return `${x.getUTCMonth()+1}/${x.getUTCDate()}`};
+const thh=t=>`<th>+${t}h${base?`<br><small>${vd(base,t)}</small>`:""}</th>`;
+let base="";   // 基準の初期時刻（実況の時刻。無ければ最新の初期時刻）
 const avg=(a,b)=>a&&b?(a+b)/2:(a||b||null);
 const at=(p,t)=>{for(let i=0;i<p.length;i++){if(p[i][0]==t)return[p[i][1],w(p[i][2])];
   if(p[i][0]>t){if(!i)return null;const a=p[i-1],b=p[i],f=(t-a[0])/(b[0]-a[0]);return[a[1]+(b[1]-a[1])*f,w(a[2])+(w(b[2])-w(a[2]))*f]}}return null};
@@ -1728,7 +1803,7 @@ function draw(it){
     for(let i=1;i<it.pts.length;i++)L.polyline([ll[i-1],ll[i]],{color:kls(avg(it.pts[i-1][3],it.pts[i][3]),it.is10)[2],weight:iw,opacity:1,lineCap:"round",interactive:false}).addTo(g);
   }else L.polyline(ll,{color:it.c,weight:it.big?4:3,dashArray:it.dash,opacity:.95,interactive:false}).addTo(g);
   it.pts.forEach(p=>{if(!p[0]||p[0]%opt.step)return;
-    mk(p[1],w(p[2]),it.c,p[3],it.is10,{e:it.ens}).bindTooltip(`${esc(it.label)} +${p[0]}h ${itxt(p[3],p[4],it.is10)}`).addTo(g);
+    mk(p[1],w(p[2]),it.c,p[3],it.is10,{e:it.ens}).bindTooltip(`${esc(it.label)} +${p[0]}h（${vt(it.init,p[0])}） ${itxt(p[3],p[4],it.is10)}`).addTo(g);
     if(opt.num){const v=w10(p[3],it.is10);if(v!=null)L.marker([p[1],w(p[2])],{icon:L.divIcon({className:"mlab2",html:`<span>${Math.round(v)}</span>`,iconSize:[0,0]}),interactive:false,keyboard:false}).addTo(g)}});
 }
 function redraw(){items.forEach(draw);apply()}
@@ -1736,19 +1811,21 @@ function setNote(t){$("#fnote").textContent=t}
 function build(){
   items.forEach(i=>{i.g.remove();i.mem&&i.mem.remove()});items=[];ana.clearLayers();
   ref=d.analysis?d.analysis.lon:140;
+  base=(d.analysis&&d.analysis.init)||(d.jma&&d.jma.init)||"";
   const add=(label,init,pts,o={})=>{const it={label,init,pts,c:colr(label),g:L.layerGroup(),visible:true,is10:!!o.is10,ens:!!o.ens,dash:o.dash,big:o.big,grp:o.grp,tag:o.tag||""};items.push(it);return it};
   if(d.jma)add("JMA公式",d.jma.init,d.jma.pts,{big:1,is10:true,grp:"off"});
   d.models.forEach(m=>add(m.label,m.init,m.pts,{grp:m.label=="JTWC公式"?"off":"det"}));
   d.ens.forEach(e=>{const it=add(e.label,e.init,e.mean,{dash:"6 5",ens:true,grp:/\(AI\)$/.test(e.label)?"ai":"ens",tag:`${e.n}メンバー`});it.members=e.members;
     it.mem=L.layerGroup();e.members.forEach(m=>L.polyline(m.map(x=>[x[1],w(x[2])]),{color:it.c,weight:1,opacity:.3,interactive:false}).addTo(it.mem))});
+  if(!base)base=items.map(i=>i.init).filter(Boolean).sort().pop()||"";
   items.forEach(draw);
-  if(d.analysis)L.circleMarker([d.analysis.lat,w(d.analysis.lon)],{radius:6,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip("解析位置 "+fmt(d.analysis.init)).addTo(ana);
+  if(d.analysis)L.circleMarker([d.analysis.lat,w(d.analysis.lon)],{radius:6,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip("解析位置 "+fmt(d.analysis.init)+"（日本時間）").addTo(ana);
   $("#fchips").innerHTML=["off","det","ens","ai"].map(g=>{const a=items.map((it,i)=>[it,i]).filter(([it])=>it.grp==g);
     return a.length?`<button type="button" class="gh" data-g="${g}"><span>${GN[g]}</span><span>まとめて切り替え</span></button><div class="srcs">${a.map(([it,i])=>`<button type="button" class="src" data-i="${i}" style="--c:${it.c}"><i class="ln${it.ens?" d":""}"></i>${esc(it.label)}<small>${fmt(it.init)}${it.tag?" "+it.tag:""}</small></button>`).join("")}</div>`:""}).join("");
   const mx=Math.min(240,Math.max(24,...items.map(i=>i.pts.length?i.pts[i.pts.length-1][0]:0)));
   $("#tau").max=mx;if(+$("#tau").value>mx)$("#tau").value=48;
   const have=items.map(i=>i.label),miss=["ECMWF","GFS","JMA-GSM","ECMWF-ENS","UKMET-ENS","JMA-GEPS","GEFS"].filter(x=>!have.includes(x)),u=new Date(d.updated),s=d.sources||{};
-  $("#fsrc").textContent=`取得元: UCAR RAL（ATCF a-deck）${isNaN(u)?"":" 更新 "+u.toLocaleString("ja-JP",{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}`+
+  $("#fsrc").textContent=`時刻はすべて日本時間（JST）。各ソース名の下の時刻は予報の初期時刻で、「+○h」はそこからの経過時間です。取得元: UCAR RAL（ATCF a-deck）${isNaN(u)?"":" 更新 "+u.toLocaleString("ja-JP",{timeZone:"Asia/Tokyo",month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"})}`+
     (s.weatherlab_ok?" ＋ Google DeepMind Weather Lab（AI）":"")+"。"+(d.jma?"公式予報は気象庁。":"")+`アンサンブル計${s.members||0}メンバー。`+
     (miss.length?`この取得元に無いモデル: ${miss.join("・")}。`:"")+"風速は10分間平均相当（モデルは1分間平均×0.88）。予報は参考値です。防災には気象庁の情報を確認してください。";
   setNote(`${items.length}種類のソースを表示中`);
@@ -1758,11 +1835,11 @@ function build(){
 function apply(){items.forEach(it=>{const on=active&&it.visible;on?it.g.addTo(map):it.g.remove();
   if(it.mem)(on&&$("#mem").checked)?it.mem.addTo(map):it.mem.remove()});
   document.querySelectorAll("#fchips .src").forEach(b=>b.classList.toggle("off",!items[+b.dataset.i].visible));marks()}
-function marks(){tm.clearLayers();const t=+$("#tau").value,out=[];$("#tv").textContent=`+${t}h`;
+function marks(){tm.clearLayers();const t=+$("#tau").value,out=[];$("#tv").innerHTML=`+${t}h${base?`<small style="display:block;font-weight:400;font-size:11px;color:var(--sub)">${vt(base,t)}（日本時間）</small>`:""}`;
   items.forEach(it=>{if(!it.visible)return;const p=at(it.pts,t);if(!p)return;const q=atv(it.pts,t);
     mk(p[0],p[1],it.c,q[0],it.is10,{e:it.ens,cur:true}).addTo(tm);
     const k=kls(q[0],it.is10),v=w10(q[0],it.is10);
-    out.push(`<div class="pr"><i class="rg${it.ens?" e":""}" style="--r:${it.c};--f:${k[2]}"></i><div class="pn"><b>${esc(it.label)}</b><small>${p[0].toFixed(1)}N ${((p[1]%360+360)%360).toFixed(1)}E${mrange(it,t)}</small></div>
+    out.push(`<div class="pr"><i class="rg${it.ens?" e":""}" style="--r:${it.c};--f:${k[2]}"></i><div class="pn"><b>${esc(it.label)}</b><small>${vt(it.init,t)} ・ ${p[0].toFixed(1)}N ${((p[1]%360+360)%360).toFixed(1)}E${mrange(it,t)}</small></div>
      <div class="iv"><strong style="color:${k[2]}">${v!=null?v.toFixed(0):"-"}</strong><small>m/s${v!=null?" "+k[1]:""}${q[1]?" "+Math.round(q[1])+"hPa":""}</small></div></div>`)});
   $("#pos").innerHTML=out.join("")||'<p class="note">この時間の予報はありません</p>'}
 const pad=()=>mobile()?{paddingTopLeft:[16,60],paddingBottomRight:[16,$("aside").offsetHeight+16]}:{paddingTopLeft:[40,40],paddingBottomRight:[40,40]};
@@ -1783,10 +1860,10 @@ $("#oStep").onchange=e=>{opt.step=+e.target.value;redraw()};
 $("#tbl").onclick=()=>{if(!d)return;const s=d.spread,dl=$("#dlg"),n=v=>v==null?"-":Math.round(v);
   dl.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b>各時刻の位置のばらつき</b><button type="button" class="btn sm" data-close>閉じる</button></div>
    <p style="color:var(--sub);font-size:12px">各モデルの予報位置が、全モデルの平均位置から何km離れているか。大きいほどモデル間で意見が割れています。</p>
-   <table><tr><th></th>${s.taus.map(t=>`<th>+${t}h</th>`).join("")}</tr>${s.rows.map(r=>`<tr><td>${esc(r[0])}</td>${r[1].map(v=>`<td>${n(v)}</td>`).join("")}</tr>`).join("")}
+   <table><tr><th></th>${s.taus.map(thh).join("")}</tr>${s.rows.map(r=>`<tr><td>${esc(r[0])}</td>${r[1].map(v=>`<td>${n(v)}</td>`).join("")}</tr>`).join("")}
    <tr><td>平均からの最大</td>${s.max.map(v=>`<td><b>${n(v)}</b></td>`).join("")}</tr><tr><td>モデル数</td>${s.n.map(v=>`<td>${v}</td>`).join("")}</tr></table>`;dl.showModal()};
 function chart(){
- const S=(d.intensity||{series:[]}).series,W=520,H=250,L0=42,R0=10,T0=10,B0=26,isW=met=="w",ix=isW?[1,2,3]:[4,5,6],vs=[];
+ const S=(d.intensity||{series:[]}).series,W=520,H=250,L0=42,R0=10,T0=10,B0=38,isW=met=="w",ix=isW?[1,2,3]:[4,5,6],vs=[];
  S.forEach(s=>s.rows.forEach(r=>ix.forEach(i=>{if(r[i]!=null)vs.push(r[i])})));
  if(!vs.length)return"<p style='color:var(--sub)'>この項目の予報値がありません</p>";
  let lo,hi;
@@ -1795,7 +1872,7 @@ function chart(){
   X=t=>L0+(W-L0-R0)*t/tmax,Y=v=>isW?T0+(H-T0-B0)*(1-(v-lo)/(hi-lo)):T0+(H-T0-B0)*(v-lo)/(hi-lo),st=isW?10:20;
  let g="";
  for(let v=Math.ceil(lo/st)*st;v<=hi;v+=st)g+=`<line x1="${L0}" x2="${W-R0}" y1="${Y(v)}" y2="${Y(v)}" stroke="#22314f"/><text x="${L0-5}" y="${Y(v)+4}" fill="#8b9bbb" font-size="10" text-anchor="end">${v}</text>`;
- for(let t=0;t<=tmax;t+=24)g+=`<line x1="${X(t)}" x2="${X(t)}" y1="${T0}" y2="${H-B0}" stroke="#22314f"/><text x="${X(t)}" y="${H-8}" fill="#8b9bbb" font-size="10" text-anchor="middle">+${t}h</text>`;
+ for(let t=0;t<=tmax;t+=24)g+=`<line x1="${X(t)}" x2="${X(t)}" y1="${T0}" y2="${H-B0}" stroke="#22314f"/><text x="${X(t)}" y="${H-(base?20:8)}" fill="#8b9bbb" font-size="10" text-anchor="middle">+${t}h</text>${base?`<text x="${X(t)}" y="${H-8}" fill="#8b9bbb" font-size="9" text-anchor="middle">${vd(base,t)}</text>`:""}`;
  if(isW)[[33,"強い"],[44,"非常に強い"],[54,"猛烈な"]].forEach(([v,n])=>{if(v<hi)g+=`<line x1="${L0}" x2="${W-R0}" y1="${Y(v)}" y2="${Y(v)}" stroke="#8b9bbb" stroke-dasharray="4 4"/><text x="${W-R0-2}" y="${Y(v)-3}" fill="#8b9bbb" font-size="10" text-anchor="end">${n}</text>`});
  S.forEach(s=>{const c=colr(s.label),rs=s.rows.filter(r=>r[ix[0]]!=null);if(!rs.length)return;
   if(s.kind=="ens"&&rs.length>1){const a=rs.map(r=>`${X(r[0])},${Y(r[ix[2]])}`),b=rs.map(r=>`${X(r[0])},${Y(r[ix[1]])}`).reverse();
@@ -1807,12 +1884,12 @@ function openInt(){if(!d)return;const S=(d.intensity||{series:[]}).series,dl=$("
  const cell=(s,t)=>{const r=s.rows.find(x=>x[0]==t);if(!r)return"<td>-</td>";
   return`<td><b>${fv(r[1])}</b><br><small style="color:var(--sub)">${s.kind=="ens"?`${fv(r[2])}〜${fv(r[3])}`:(r[4]?r[4]+"hPa":"")}</small></td>`};
  const pr=ens.length?`<p style="color:var(--sub);font-size:12px;margin-top:14px">各階級以上になるメンバーの割合（強い以上／非常に強い以上／猛烈な, %）</p>
-  <table><tr><th></th>${T.map(t=>`<th>+${t}h</th>`).join("")}</tr>${ens.map(s=>`<tr><td>${esc(s.label)}</td>${T.map(t=>{const r=s.rows.find(x=>x[0]==t);return`<td>${r&&r[8]?r[8].join("/"):"-"}</td>`}).join("")}</tr>`).join("")}</table>`:"";
+  <table><tr><th></th>${T.map(thh).join("")}</tr>${ens.map(s=>`<tr><td>${esc(s.label)}</td>${T.map(t=>{const r=s.rows.find(x=>x[0]==t);return`<td>${r&&r[8]?r[8].join("/"):"-"}</td>`}).join("")}</tr>`).join("")}</table>`:"";
  dl.innerHTML=`<div style="display:flex;justify-content:space-between;align-items:center"><b>強さの予報</b><button type="button" class="btn sm" data-close>閉じる</button></div>
   <div class="btns" style="margin:8px 0"><button type="button" class="btn sm${met=="w"?" on":""}" data-met="w">風速(m/s)</button><button type="button" class="btn sm${met=="p"?" on":""}" data-met="p">中心気圧(hPa)</button></div>
   ${chart()}<div style="display:flex;flex-wrap:wrap;gap:4px;margin:6px 0">${legendH}</div>
-  <p style="color:var(--sub);font-size:12px">実線=単独モデル、破線＋帯=アンサンブル平均と10〜90%範囲。風速は10分間平均相当（モデルは1分間平均×0.88）。全球モデルは分解能の都合で猛烈な台風を弱めに予報しがちです。</p>
-  <table><tr><th></th>${T.map(t=>`<th>+${t}h</th>`).join("")}</tr>${S.map(s=>`<tr><td style="color:${colr(s.label)}">${esc(s.label)}</td>${T.map(t=>cell(s,t)).join("")}</tr>`).join("")}</table>${pr}`;
+  <p style="color:var(--sub);font-size:12px">実線=単独モデル、破線＋帯=アンサンブル平均と10〜90%範囲。横軸の下段は日付（日本時間）です。風速は10分間平均相当（モデルは1分間平均×0.88）。全球モデルは分解能の都合で猛烈な台風を弱めに予報しがちです。</p>
+  <table><tr><th></th>${T.map(thh).join("")}</tr>${S.map(s=>`<tr><td style="color:${colr(s.label)}">${esc(s.label)}</td>${T.map(t=>cell(s,t)).join("")}</tr>`).join("")}</table>${pr}`;
  if(!dl.open)dl.showModal()}
 $("#int").onclick=openInt;
 $("#dlg").addEventListener("click",e=>{const dl=$("#dlg");
