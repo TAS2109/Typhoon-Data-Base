@@ -593,13 +593,13 @@ def dedupe(con):
     con.execute(f"DELETE FROM typhoons WHERE sid IN ({dup})")
 
 # ---------------- 特徴量（移動距離・復活・越境・ループ・急発達） ----------------
-FEAT_V = "1"  # 判定ロジックを変えたら上げる（起動時に全件を再計算する）
+FEAT_V = "2"  # 判定ロジックを変えたら上げる（起動時に全件を再計算する）
 # めずらしい台風の絞り込み条件（tv ビューの列）。複数指定は「全てに当てはまる」
 TAGS = {"rev": "rev>0", "cin": "cin=1", "cout": "cout=1", "lp": "lp=1", "ri": "ri>=30"}
 FEAT_SQL = """
 CREATE TABLE IF NOT EXISTS feat(sid TEXT PRIMARY KEY, dist REAL, net REAL, rev INT, rev_a TEXT, rev_t TEXT,
-    cin INT, cout INT, lp INT, ri INT);
-CREATE VIEW IF NOT EXISTS tv AS SELECT t.*, f.dist, f.net, f.rev, f.rev_a, f.rev_t, f.cin, f.cout, f.lp, f.ri
+    cin INT, cout INT, lp INT, ri INT, r30 REAL, r50 REAL);
+CREATE VIEW IF NOT EXISTS tv AS SELECT t.*, f.dist, f.net, f.rev, f.rev_a, f.rev_t, f.cin, f.cout, f.lp, f.ri, f.r30, f.r50
     FROM typhoons t LEFT JOIN feat f ON f.sid = t.sid;
 """
 
@@ -703,8 +703,13 @@ def feat_update(con, full=False):
     if sids:
         rows = con.execute("SELECT sid, time, lat, lon, wind, pres FROM points "
                            "WHERE sid IN (SELECT value FROM json_each(?)) ORDER BY sid, time", (json.dumps(sids),))
-        out = [(sid, *track_feats([r[1:] for r in g])) for sid, g in groupby(rows, key=lambda r: r[0])]
-        con.executemany("INSERT OR REPLACE INTO feat VALUES(?,?,?,?,?,?,?,?,?,?)", out)
+        try:  # 強風域・暴風域の最大半径（km）。半径テーブルが無い旧DBでは空
+            rmax = {r[0]: (r[1], r[2]) for r in con.execute("SELECT sid, MAX(l30), MAX(l50) FROM radii GROUP BY sid")}
+        except sqlite3.OperationalError:
+            rmax = {}
+        out = [(sid, *track_feats([r[1:] for r in g]), *(round(v * NM) if v else None for v in rmax.get(sid, (None, None))))
+               for sid, g in groupby(rows, key=lambda r: r[0])]
+        con.executemany("INSERT OR REPLACE INTO feat VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", out)
     con.execute("DELETE FROM feat WHERE sid NOT IN (SELECT sid FROM typhoons)")
     con.execute("INSERT OR REPLACE INTO meta VALUES('feat_v',?)", (FEAT_V,))
 
@@ -932,18 +937,59 @@ def years():
 
 SORTS = {"number": "year {d}, number {d}", "date": "start_time {d}",
          "wind": "max_wind IS NULL, max_wind {d}", "pres": "min_pres IS NULL, min_pres {d}",
-         "days": "days {d}", "dist": "dist IS NULL, dist {d}", "name": "name_en = '', name_en {d}"}
+         "days": "days {d}", "dist": "dist IS NULL, dist {d}", "size": "r30 IS NULL, r30 {d}", "name": "name_en = '', name_en {d}"}
 
 import math, json
 from fastapi import Depends
 from fastapi.responses import Response, JSONResponse, RedirectResponse
+
+DIRB = {1: 45, 2: 90, 3: 135, 4: 180, 5: 225, 6: 270, 7: 315, 8: 0}  # 向きコード→方位[度]
+
+def _dest(la, lo, b, km):
+    d, t, p1 = km / 6371.0, math.radians(b), math.radians(la)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(t))
+    dl = math.atan2(math.sin(t) * math.sin(d) * math.cos(p1), math.cos(d) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), lo + math.degrees(dl)
+
+def zone_ids(la, lo, key):
+    """指定地点が 暴風域(r50)・強風域(r30) に入った台風のsid。半径は(中心のずれ, 半径)の円として判定し、
+    隣り合う観測（12時間以内）の間は円を直線的に補間して見る。"""
+    d, l, sh = ("d50", "l50", "s50") if key == "r50" else ("d30", "l30", "s30")
+    try:
+        rows = q(f"SELECT r.sid, r.time, p.lat, p.lon, r.{d} AS d, r.{l} AS l, r.{sh} AS s FROM radii r "
+                 f"JOIN points p ON p.sid=r.sid AND p.time=r.time WHERE r.{l}>0 AND p.lat BETWEEN ? AND ? "
+                 f"ORDER BY r.sid, r.time", (la - 25, la + 25))
+    except sqlite3.OperationalError:
+        return set()  # 半径テーブルが無い旧DB
+    ids, prev = set(), None
+    for r in rows:
+        sid = r["sid"]
+        if sid in ids:
+            prev = None
+            continue
+        lg = r["l"] * NM; s2 = min(r["s"] or r["l"], r["l"]) * NM
+        off = (lg - s2) / 2 if (r["d"] in DIRB and s2 < lg) else 0
+        c = _dest(r["lat"], r["lon"], DIRB[r["d"]], off) if off else (r["lat"], r["lon"])
+        cur = (sid, datetime.strptime(r["time"][:19], F), c[0], c[1], (lg + s2) / 2 if off else lg)
+        if _gc(la, lo, cur[2], cur[3]) <= cur[4]:
+            ids.add(sid); prev = None
+            continue
+        if prev and prev[0] == sid and (cur[1] - prev[1]).total_seconds() <= 12 * 3600:
+            dlo = (cur[3] - prev[3] + 540) % 360 - 180
+            for k in range(1, 6):
+                t = k / 6
+                if _gc(la, lo, prev[2] + (cur[2] - prev[2]) * t, prev[3] + dlo * t) <= prev[4] + (cur[4] - prev[4]) * t:
+                    ids.add(sid)
+                    break
+        prev = cur
+    return ids
 
 def flt(name: str | None = None, year_from: int | None = None, year_to: int | None = None,
         month: int | None = None, wind_min: float | None = None, wind_max: float | None = None,
         pres_max: float | None = None, days_min: float | None = None, named: bool = False,
         dist_min: float | None = None, dist_max: float | None = None, tag: str | None = None,
         near: str | None = None):
-    """絞り込み条件（一覧・重ね表示・統計で共通）→ (WHERE句, 引数)。near は 'lat,lon,km'"""
+    """絞り込み条件（一覧・重ね表示・統計で共通）→ (WHERE句, 引数)。near は 'lat,lon,km'（km の代わりに r30=強風域に入った / r50=暴風域に入った）"""
     where, args = [], []
     def add(c, v): where.append(c); args.append(v)
     if name and name.strip():
@@ -965,7 +1011,13 @@ def flt(name: str | None = None, year_from: int | None = None, year_to: int | No
         if t not in TAGS: raise HTTPException(422, "tag は rev,cin,cout,lp,ri のいずれかで指定してください")
         where.append(TAGS[t])
     if near:
-        try: la, lo, km = (float(x) for x in near.split(","))
+        pt = near.split(",")
+        try: la, lo, zk = float(pt[0]), float(pt[1]), pt[2].strip()
+        except (ValueError, IndexError): raise HTTPException(422, "near は lat,lon,km の形式で指定してください")
+        if zk in ("r30", "r50"):
+            where.append("sid IN (SELECT value FROM json_each(?))"); args.append(json.dumps(sorted(zone_ids(la, lo, zk))))
+            return (("WHERE " + " AND ".join(where)) if where else ""), args
+        try: km = float(zk)
         except ValueError: raise HTTPException(422, "near は lat,lon,km の形式で指定してください")
         dla, dlo = km / 111.0, km / (111.0 * max(0.05, math.cos(math.radians(la))))
         ids = set()
@@ -1005,7 +1057,7 @@ def tracks(fl=Depends(flt), limit: int = Query(300, le=600)):
 @app.get("/api/stats")
 def stats(fl=Depends(flt)):
     w, args = fl
-    rows = q(f"SELECT sid, year, month, max_wind, days, title, dist, rev, cin, cout, lp, ri FROM tv {w}", args)
+    rows = q(f"SELECT sid, year, month, max_wind, days, title, dist, rev, cin, cout, lp, ri, r30 FROM tv {w}", args)
     yrs, mon, cls = {}, [0] * 12, {}
     for r in rows:
         yrs[r["year"]] = yrs.get(r["year"], 0) + 1
@@ -1017,12 +1069,14 @@ def stats(fl=Depends(flt)):
     mx = max(ds, key=lambda r: r["days"], default=None)
     dd = [r for r in rows if r["dist"] is not None]
     top = sorted(dd, key=lambda r: -r["dist"])[:5]
+    big = sorted((r for r in rows if r["r30"]), key=lambda r: -r["r30"])[:5]
     tg = {k: 0 for k in TAGS}
     for r in rows:
         for k in tags_of(r): tg[k] += 1
     return {"total": len(rows), "months": mon, "classes": cls, "tags": tg,
             "avg_dist": round(sum(r["dist"] for r in dd) / len(dd)) if dd else None,
             "max_dist": round(top[0]["dist"]) if top else None,
+            "top_size": [{"sid": r["sid"], "title": r["title"], "r30": round(r["r30"])} for r in big],
             "top_dist": [{"sid": r["sid"], "title": r["title"], "dist": round(r["dist"])} for r in top],
             "years": [[y, yrs.get(y, 0)] for y in range(min(yrs), max(yrs) + 1)] if yrs else [],
             "avg_days": round(sum(r["days"] for r in ds) / len(ds), 1) if ds else None,
@@ -1600,11 +1654,11 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
      <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
     <div class="chips wide" id="tgChips" aria-label="特徴で絞り込み"><button type="button" class="chip" data-tg="rev">復活台風</button><button type="button" class="chip" data-tg="cin">越境台風</button><button type="button" class="chip" data-tg="cout">180度の東へ</button><button type="button" class="chip" data-tg="lp">迷走(ループ)</button><button type="button" class="chip" data-tg="ri">急発達</button></div>
     <div class="note wide" id="tgNote" hidden></div>
-    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="dist">移動距離順</option><option value="name">名前順</option></select>
+    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="dist">移動距離順</option><option value="size">強風域の大きさ順</option><option value="name">名前順</option></select>
      <button type="button" id="dir" title="昇順・降順">降順</button><input type="hidden" name="order" value="desc"></div>
     <details id="dPl"><summary>地点から探す（近くを通った台風）</summary><div class="pl2">
      <div class="btns"><button type="button" class="btn" id="tNear">現在地から</button><button type="button" class="btn" id="tPick">地図で指定</button><button type="button" class="btn" id="tClr" hidden>指定を解除</button></div>
-     <label>近くを通った範囲<select name="km"><option value="100">100km以内</option><option value="300" selected>300km以内</option><option value="500">500km以内</option><option value="1000">1000km以内</option></select></label>
+     <label>範囲<select name="km"><option value="100">100km以内</option><option value="300" selected>300km以内</option><option value="500">500km以内</option><option value="1000">1000km以内</option><option value="r30">強風域に入った</option><option value="r50">暴風域に入った</option></select></label>
      <div class="note" id="nearTxt">地点を指定すると、その近くを通った台風だけを表示します。</div></div></details>
     <details><summary>詳細条件</summary><div class="f2">
      <label>年（から）<select name="year_from"><option value="">指定なし</option></select></label>
@@ -1770,6 +1824,13 @@ function drawWz(){wzL.clearLayers();if(!cur)return;
 function drawWzNow(){wzN.clearLayers();if(!cur)return;const p=cur.pts[cur.i];if(!p||!p.r)return;
   ["r30","r50"].forEach(k=>{if(!wz[k])return;const g=wzShape(cur.ll[cur.i][0],cur.ll[cur.i][1],p.r,k);
     if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",fillColor:WZC[k],fillOpacity:.16,interactive:false}).addTo(wzN)})}
+// 再生バーのグラフに、半径の推移を細い点線で重ねる（強風域・暴風域のチップがONの分だけ。縦軸は共通で、最大の強風半径=グラフの高さ）
+function drawRg(){const g=$("#rg");if(!g||!cur)return;
+  const P=cur.pts,mx=Math.max(1,...P.map(p=>p.r?Math.max(p.r[1]||0,p.r[4]||0):0));
+  g.innerHTML=["r30","r50"].filter(k=>wz[k]).map(k=>{const o=k=="r50"?0:3;let d="",on=false;
+    P.forEach((p,i)=>{const v=p.r&&p.r[o+1];if(!v){on=false;return}
+      d+=`${on?"L":"M"}${cur.xs[i].toFixed(1)},${(38-v/mx*34).toFixed(1)}`;on=true});
+    return d?`<path d="${d}" fill="none" stroke="${WZC[k]}" stroke-width="1.5" stroke-dasharray="4 3" opacity=".9" vector-effect="non-scaling-stroke"><title>${WZN[k]}の半径（最大 ${Math.round(Math.max(0,...P.map(p=>p.r&&p.r[o+1]||0)))}km）</title></path>`:""}).join("")}
 let first=true,cur=null,playT=null,near=null,pick=false,ovOn=false,lastP=new URLSearchParams();
 
 // 一覧パネル（スマホ: 下から出るシート）
@@ -1820,7 +1881,7 @@ async function load(){
     $("#count").classList.remove("busy");
     $("#count").textContent=total?`${total}件`+(total>rows.length?`中 ${rows.length}件を表示（件数を増やすか条件を絞ってください）`:""):"該当なし。条件を変えてください";
     $("#list").innerHTML=rows.map(r=>`<li data-sid="${esc(r.sid)}"><span class="bar" style="background:${col(r.max_wind)}"></span>
-     <div class="t"><b>${esc(r.title)}${r.prov?"<em>速報</em>":""}${(r.tg||[]).map(k=>`<em class="tg k-${k}">${TGS[k]}</em>`).join("")}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日${r.dist!=null?` ／ ${dst(r.dist)}km`:""}</span>
+     <div class="t"><b>${esc(r.title)}${r.prov?"<em>速報</em>":""}${(r.tg||[]).map(k=>`<em class="tg k-${k}">${TGS[k]}</em>`).join("")}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日${f.sort.value=="size"?(r.r30?` ／ 強風域 ${dst(r.r30)}km`:" ／ 半径データなし"):(r.dist!=null?` ／ ${dst(r.dist)}km`:"")}</span>
      <div class="m"><i style="width:${Math.min(100,(r.max_wind||0)/0.67)}%;background:${col(r.max_wind)}"></i></div></div>
      <div class="v"><strong>${r.max_wind??"-"}</strong><small>m/s</small><small>${r.min_pres??"-"}hPa</small></div></li>`).join("");
     const on=curSid&&$(`#list li[data-sid="${CSS.escape(curSid)}"]`);if(on)on.classList.add("on");
@@ -1833,7 +1894,7 @@ addEventListener("keydown",e=>{if(tab!="db"||/INPUT|SELECT|TEXTAREA/.test(e.targ
   if(e.key=="ArrowDown"||e.key=="j"){e.preventDefault();nav(1)}else if(e.key=="ArrowUp"||e.key=="k"){e.preventDefault();nav(-1)}else if(e.key==" "&&cur){e.preventDefault();play()}});
 // 進行アニメーション
 function setPos(i){if(!cur)return;cur.i=i;const p=cur.pts[i];cur.mk.setLatLng(cur.ll[i]);drawWzNow();
-  $("#scrub").value=i;$("#rd").textContent=`${jst(p.time,1)} ・ ${spd(p.wind)} ・ ${p.pres??"-"}hPa`;
+  $("#scrub").value=i;$("#rd").textContent=`${jst(p.time,1)} ・ ${spd(p.wind)} ・ ${p.pres??"-"}hPa`+["r50","r30"].filter(k=>wz[k]&&p.r&&p.r[(k=="r50"?0:3)+1]).map(k=>` ・ ${WZN[k]}${p.r[(k=="r50"?0:3)+1]}km`).join("");
   const c=$("#cur");if(c){c.setAttribute("x1",cur.xs[i]);c.setAttribute("x2",cur.xs[i])}
   if(tab!="db")return;
   const pt=map.latLngToContainerPoint(cur.ll[i]),s=map.getSize(),bh=barH(),rx=mobile()?0:350,top=mobile()?50:20;
@@ -1850,7 +1911,7 @@ function csv(){if(!cur)return toast("台風を選択してください");
 $("#info").addEventListener("click",e=>{const b=e.target.closest("[data-a]");if(!b)return;
   ({prev:()=>nav(-1),next:()=>nav(1),share,csv,play,list:openPanel,close:()=>{$("#info").hidden=true;stop()}})[b.dataset.a]()});
 $("#info").addEventListener("click",e=>{const b=e.target.closest("[data-wz]");if(!b)return;
-  const k=b.dataset.wz;wz[k]=!wz[k];b.classList.toggle("on",wz[k]);drawWz();drawWzNow()});
+  const k=b.dataset.wz;wz[k]=!wz[k];b.classList.toggle("on",wz[k]);drawWz();drawWzNow();drawRg();setPos(cur?cur.i:0)});
 let seq=0;
 async function show(sid,li,keep){
   const my=++seq;stop();curSid=sid;
@@ -1894,23 +1955,24 @@ async function show(sid,li,keep){
    <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div>
    <div><small>移動距離</small><strong>${dist?dist.toLocaleString():"-"}<span> km</span></strong></div>
    <div><small>平均の速さ</small><strong>${spdv}<span> km/h</span></strong></div></div>
-   <div class="st"><b style="color:${col(t.max_wind)}">${cls(t.max_wind)}</b><span>最大 ${spd(t.max_wind)}</span><span>${t.min_pres??"-"}hPa</span><span>${t.days}日</span>${dist?`<span>${dist.toLocaleString()}km</span>`:""}</div>
+   <div class="st"><b style="color:${col(t.max_wind)}">${cls(t.max_wind)}</b><span>最大 ${spd(t.max_wind)}</span><span>${t.min_pres??"-"}hPa</span><span>${t.days}日</span>${dist?`<span>${dist.toLocaleString()}km</span>`:""}${t.r30?`<span>強風域 最大${dst(t.r30)}km${t.r50?` ／ 暴風域 最大${dst(t.r50)}km`:""}</span>`:""}</div>
    <div class="pl"><button type="button" class="btn" id="play" data-a="play">再生</button><div class="chart"><div id="rd"></div>
-    <svg viewBox="0 0 ${W} 40" preserveAspectRatio="none"><polyline points="${wl}" fill="none" stroke="${col(t.max_wind)}" stroke-width="2" vector-effect="non-scaling-stroke"/>
+    <svg viewBox="0 0 ${W} 40" preserveAspectRatio="none"><polyline points="${wl}" fill="none" stroke="${col(t.max_wind)}" stroke-width="2" vector-effect="non-scaling-stroke"/><g id="rg"></g>
     <line id="cur" x1="0" x2="0" y1="0" y2="40" stroke="#fff" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
     <input id="scrub" type="range" min="0" max="${Math.max(0,n-1)}" value="0" aria-label="時刻"></div></div>
    <div class="acts"><button type="button" class="btn mo" data-a="list">一覧</button><button type="button" class="btn" data-a="prev">前へ</button><button type="button" class="btn" data-a="next">次へ</button><button type="button" class="btn" data-a="share">共有</button><button type="button" class="btn" data-a="csv">CSV</button></div>`;
   $("#scrub").oninput=e=>{stop();setPos(+e.target.value)};
   if(!keep&&tab=="db")map.fitBounds(cur.bounds,fitOpt());
-  drawWz();setPos(0);
+  drawWz();drawRg();setPos(0);
 }
 // ---- 地点から探す / 重ね表示 ----
 function drawNear(){nearL.clearLayers();$("#tNear").classList.toggle("on",!!near);$("#tClr").hidden=!near;
-  $("#nearTxt").textContent=near?`北緯${near[0].toFixed(1)}度・東経${near[1].toFixed(1)}度から ${f.km.value}km 以内を通った台風を表示中`:"地点を指定すると、その近くを通った台風だけを表示します。";
-  if(near){$("#dPl").open=true;L.circle(near,{radius:f.km.value*1000,color:"#38bdf8",weight:1,fillOpacity:.07,interactive:false}).addTo(nearL);
+  const zk=/^r\d+$/.test(f.km.value);   // r30/r50 = 強風域・暴風域に入った台風
+  $("#nearTxt").textContent=near?(zk?`北緯${near[0].toFixed(1)}度・東経${near[1].toFixed(1)}度が${WZN[f.km.value]}に入った台風を表示中`:`北緯${near[0].toFixed(1)}度・東経${near[1].toFixed(1)}度から ${f.km.value}km 以内を通った台風を表示中`):"地点を指定すると、その近くを通った台風だけを表示します。";
+  if(near){$("#dPl").open=true;if(!zk)L.circle(near,{radius:f.km.value*1000,color:"#38bdf8",weight:1,fillOpacity:.07,interactive:false}).addTo(nearL);
     L.circleMarker(near,{radius:5,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:1,interactive:false}).addTo(nearL)}}
 function setNear(la,lo){near=la==null?null:[+la.toFixed(3),+lo.toFixed(3)];load();
-  if(near)map.fitBounds(L.circle(near,{radius:f.km.value*1000}).getBounds(),fitOpt())}
+  if(near)map.fitBounds(L.circle(near,{radius:(/^r\d+$/.test(f.km.value)?500:f.km.value)*1000}).getBounds(),fitOpt())}
 $("#tNear").onclick=()=>{if(near)return setNear(null);
   if(!navigator.geolocation)return toast("位置情報を使えません");toast("現在地を取得中…");
   navigator.geolocation.getCurrentPosition(p=>setNear(p.coords.latitude,p.coords.longitude),()=>toast("現在地を取得できません。「地図で指定」をお試しください"),{timeout:10000})};
@@ -1939,7 +2001,7 @@ function condText(p){const a=[],g=k=>p.get(k);
   if(g("dist_min"))a.push(`移動距離${g("dist_min")}km以上`);
   if(g("dist_max"))a.push(`移動距離${g("dist_max")}km以下`);
   if(g("tag"))a.push(g("tag").split(",").map(k=>TGN[k]||k).join("かつ"));
-  if(g("near")){const[la,lo,k]=g("near").split(",");a.push(`地点（北緯${(+la).toFixed(1)}度・東経${(+lo).toFixed(1)}度）から${k}km以内`)}
+  if(g("near")){const[la,lo,k]=g("near").split(",");a.push(/^r\d+$/.test(k)?`地点（北緯${(+la).toFixed(1)}度・東経${(+lo).toFixed(1)}度）が${WZN[k]}に入った`:`地点（北緯${(+la).toFixed(1)}度・東経${(+lo).toFixed(1)}度）から${k}km以内`)}
   return a.length?a.join(" ／ "):"条件なし（全ての台風）"}
 let stSeq=0;
 async function loadStats(){
@@ -1948,6 +2010,7 @@ async function loadStats(){
   try{const s=await (await fetch("/api/stats?"+q)).json();if(my!=stSeq)return;
     const tot=s.total||1,ys=s.years,cl=[...CLS,UNK].map(c=>[c[1],s.classes[c[1]]||0,c[2]]).filter(c=>c[1]);
     const tg=s.tags||{},tgh=Object.keys(TGN).map(k=>`<span class="k-${k}" data-tg="${k}"><i style="background:var(--tc)"></i>${TGN[k]} ${tg[k]||0}</span>`).join(""),
+      rs=(s.top_size||[]).map((r,i)=>`<li data-sid="${esc(r.sid)}"><span>${i+1}. ${esc(r.title)}</span><b>${dst(r.r30)}km</b></li>`).join(""),
       rk=(s.top_dist||[]).map((r,i)=>`<li data-sid="${esc(r.sid)}"><span>${i+1}. ${esc(r.title)}</span><b>${dst(r.dist)}km</b></li>`).join("");
     const bars=(a,c)=>{const mx=Math.max(1,...a.map(x=>x[1])),w=100/a.length;
       return `<svg class="bs" viewBox="0 0 100 40" preserveAspectRatio="none">${a.map((x,i)=>`<rect x="${(i*w+.15).toFixed(2)}" y="${(38-x[1]/mx*36).toFixed(2)}" width="${(w-.3).toFixed(2)}" height="${(x[1]/mx*36).toFixed(2)}" fill="${c}"><title>${x[0]}: ${x[1]}</title></rect>`).join("")}</svg>`};
@@ -1959,6 +2022,7 @@ async function loadStats(){
      <div class="lg">${cl.map(c=>`<span><i style="background:${c[2]}"></i>${c[0]} ${c[1]}</span>`).join("")}</div>
      <h3 class="sh">めずらしい台風（タップでその台風だけを一覧に表示）</h3><div class="lg">${tgh}</div>
      ${rk?`<h3 class="sh">移動距離が長い台風 Top5</h3><ul class="rk">${rk}</ul>`:""}
+     ${rs?`<h3 class="sh">強風域が大きかった台風 Top5（最大半径）</h3><ul class="rk">${rs}</ul>`:""}
      <h3 class="sh">月別の発生数</h3>${bars(s.months.map((n,i)=>[(i+1)+"月",n]),"#38bdf8")}<div class="ax"><span>1月</span><span>6月</span><span>12月</span></div>
      ${ys.length>1?`<h3 class="sh">年別の発生数</h3>${bars(ys,"#ff8a3d")}<div class="ax"><span>${ys[0][0]}</span><span>${ys[ys.length-1][0]}</span></div>`:""}`;
   }catch(e){if(my==stSeq)b.innerHTML='<p class="note">集計に失敗しました。時間をおいて再度お試しください</p>'}}
