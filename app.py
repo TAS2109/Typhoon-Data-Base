@@ -7,12 +7,15 @@
 今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）＋デジタル台風（NII、PDF未掲載の消滅済み台風の補完）で随時更新する。
 データ出典: 気象庁 / IBTrACS / デジタル台風（国立情報学研究所・北本朗）
 画面: 1ページ・地図共有の3タブ構成（予報 / 過去の台風 / 統計）。旧 /forecast は /#fc へ転送。
+めずらしい台風（復活・越境・ループ・急発達）と移動距離は、各台風の点列から自動判定して feat テーブルに保存する。
+  判定結果の確認:  python app.py featdiag
 """
-import asyncio, csv, io, os, re, sqlite3, sys
+import asyncio, csv, io, json, math, os, re, sqlite3, sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import requests
 from concurrent.futures import ThreadPoolExecutor
+from itertools import groupby
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -139,6 +142,7 @@ def build():
         insert(con, m["sid"], y, seq[y], m["en"], m["p"])
     con.executescript("CREATE INDEX idx_points_sid ON points(sid); CREATE INDEX idx_ty_year ON typhoons(year, number);")
     con.execute("INSERT INTO meta VALUES('built_at',?)", (datetime.now().strftime("%Y-%m-%d"),))
+    feat_update(con, full=True)  # 移動距離・復活・越境などの特徴量
     con.commit(); con.close()
     os.replace(tmp, DB)
     print(f"Done: {len(metas)} typhoons（今年の速報値は起動後に自動で取り込みます）")
@@ -388,6 +392,149 @@ def dedupe(con):
     con.execute(f"DELETE FROM points WHERE sid IN ({dup})")
     con.execute(f"DELETE FROM typhoons WHERE sid IN ({dup})")
 
+# ---------------- 特徴量（移動距離・復活・越境・ループ・急発達） ----------------
+FEAT_V = "1"  # 判定ロジックを変えたら上げる（起動時に全件を再計算する）
+# めずらしい台風の絞り込み条件（tv ビューの列）。複数指定は「全てに当てはまる」
+TAGS = {"rev": "rev>0", "cin": "cin=1", "cout": "cout=1", "lp": "lp=1", "ri": "ri>=30"}
+FEAT_SQL = """
+CREATE TABLE IF NOT EXISTS feat(sid TEXT PRIMARY KEY, dist REAL, net REAL, rev INT, rev_a TEXT, rev_t TEXT,
+    cin INT, cout INT, lp INT, ri INT);
+CREATE VIEW IF NOT EXISTS tv AS SELECT t.*, f.dist, f.net, f.rev, f.rev_a, f.rev_t, f.cin, f.cout, f.lp, f.ri
+    FROM typhoons t LEFT JOIN feat f ON f.sid = t.sid;
+"""
+
+def _gc(la1, lo1, la2, lo2):
+    """2点間の大圏距離[km]"""
+    p1, p2 = math.radians(la1), math.radians(la2)
+    c = math.sin(p1) * math.sin(p2) + math.cos(p1) * math.cos(p2) * math.cos(math.radians((lo2 - lo1 + 540) % 360 - 180))
+    return 6371.0 * math.acos(max(-1.0, min(1.0, c)))
+
+def _brg(la1, lo1, la2, lo2):
+    """1点目から2点目への方位[度]（-180〜180）"""
+    p1, p2, d = math.radians(la1), math.radians(la2), math.radians((lo2 - lo1 + 540) % 360 - 180)
+    return math.degrees(math.atan2(math.sin(d) * math.cos(p2),
+                                   math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(d)))
+
+def track_feats(p):
+    """p: [(time_utc, lat, lon, wind_kt, pres), ...]（時刻順）→
+    (移動距離km, 直線距離km, 復活の回数, 弱まる直前の時刻, 再び台風になった時刻, 越境(入), 域外へ(出), ループ, 24h最大増速kt)
+
+    ・復活台風: 風速34kt(17.2m/s)以上 → 34kt未満の時間帯 → 再び34kt以上（号数は同じまま）。
+      風速が空欄の点が続くだけの場合は、3点(約18時間)以上続いた時だけ「弱まった」とみなす。
+    ・越境台風: 軌跡の最初の点が東経178度以東（=東経180度の東側から入ってきた）。
+    ・域外へ: 最初は東経180度の西側にいて、のちに東経180度を越えて東側へ進んだ。
+    ・ループ: 進路の向きの累積変化（時計回り・反時計回り）の幅が300度以上＝ほぼ1周した。
+    ・急発達: 24時間で最大風速が30kt（約15m/s）以上強まった（ri に最大増速kt）。"""
+    ts = [datetime.strptime(x[0][:19], F) for x in p]
+    dist = sum(_gc(p[i - 1][1], p[i - 1][2], p[i][1], p[i][2]) for i in range(1, len(p)))
+    net = _gc(p[0][1], p[0][2], p[-1][1], p[-1][2])
+    # 復活
+    rev, rev_a, rev_t = 0, None, None
+    last, weak, unk, unk_max = None, 0, 0, 0
+    for i, x in enumerate(p):
+        w = x[3]
+        if w is not None and w >= 34:
+            if (last is not None and i - last > 1 and ts[i] - ts[last] >= timedelta(hours=12)
+                    and (weak >= 1 or unk_max >= 3)):
+                rev += 1
+                if rev_t is None:
+                    rev_a, rev_t = p[last][0], x[0]
+            last, weak, unk, unk_max = i, 0, 0, 0
+        elif last is not None:
+            if w is None:
+                unk += 1; unk_max = max(unk_max, unk)
+            else:
+                weak += 1; unk = 0
+    # 急発達
+    byt = {ts[i]: x[3] for i, x in enumerate(p) if x[3] is not None}
+    ri = 0
+    for t, w in byt.items():
+        w2 = byt.get(t + timedelta(hours=24))
+        if w2 is not None and w2 - w > ri:
+            ri = w2 - w
+    # 越境（経度は 0〜360 に直し、日付変更線をまたいでも連続になるよう補正）
+    lu, prev = [], None
+    for x in p:
+        lo = x[2] % 360
+        if prev is not None:
+            while lo - prev > 180: lo -= 360
+            while lo - prev < -180: lo += 360
+        lu.append(lo); prev = lo
+    cin = 1 if lu[0] >= 178.0 else 0
+    cout = 1 if (not cin and max(lu) >= 180.0) else 0
+    # ループ（30km未満の動きは向きが不安定なので飛ばす）
+    cum = cmin = cmax = 0.0
+    hp, a = None, p[0]
+    for x in p[1:]:
+        if _gc(a[1], a[2], x[1], x[2]) < 30:
+            continue
+        h = _brg(a[1], a[2], x[1], x[2])
+        if hp is not None:
+            cum += (h - hp + 540) % 360 - 180
+            cmin, cmax = min(cmin, cum), max(cmax, cum)
+        hp, a = h, x
+    lp = 1 if cmax - cmin >= 300 else 0
+    return (round(dist), round(net), rev, rev_a, rev_t, cin, cout, lp, int(round(ri)))
+
+def tags_of(r):
+    """DBの行 → めずらしい台風の種類 ['rev','cin',...]"""
+    t = []
+    if r.get("rev"): t.append("rev")
+    if r.get("cin"): t.append("cin")
+    if r.get("cout"): t.append("cout")
+    if r.get("lp"): t.append("lp")
+    if (r.get("ri") or 0) >= 30: t.append("ri")
+    return t
+
+def feat_update(con, full=False):
+    """特徴量を points から計算して feat に保存する。
+    通常は「未計算の台風」と「直近2年（速報で変わる）」だけ。判定ロジックの版(FEAT_V)が違えば全件。"""
+    ver = (con.execute("SELECT v FROM meta WHERE k='feat_v'").fetchone() or [None])[0]
+    if ver != FEAT_V:
+        con.executescript("DROP VIEW IF EXISTS tv; DROP TABLE IF EXISTS feat;")
+        full = True
+    con.executescript(FEAT_SQL)
+    if full:
+        sids = [r[0] for r in con.execute("SELECT sid FROM typhoons")]
+    else:
+        top = con.execute("SELECT MAX(year) FROM typhoons").fetchone()[0] or 0
+        sids = [r[0] for r in con.execute(
+            "SELECT sid FROM typhoons WHERE year>=? OR sid NOT IN (SELECT sid FROM feat)", (top - 1,))]
+    if sids:
+        rows = con.execute("SELECT sid, time, lat, lon, wind, pres FROM points "
+                           "WHERE sid IN (SELECT value FROM json_each(?)) ORDER BY sid, time", (json.dumps(sids),))
+        out = [(sid, *track_feats([r[1:] for r in g])) for sid, g in groupby(rows, key=lambda r: r[0])]
+        con.executemany("INSERT OR REPLACE INTO feat VALUES(?,?,?,?,?,?,?,?,?,?)", out)
+    con.execute("DELETE FROM feat WHERE sid NOT IN (SELECT sid FROM typhoons)")
+    con.execute("INSERT OR REPLACE INTO meta VALUES('feat_v',?)", (FEAT_V,))
+
+def feat_init():
+    """旧バージョンで作ったDBに特徴量が無い場合の移行。起動時に1回だけ全件を計算する（数秒）。"""
+    try:
+        con = sqlite3.connect(DB, timeout=60)
+        try:
+            feat_update(con); con.commit()
+        finally:
+            con.close()
+    except Exception as e:
+        print("feat_init failed:", repr(e), flush=True)
+
+def featdiag():
+    """python app.py featdiag : 復活・越境などの判定結果の一覧。気象庁の公表と見比べて確認する用。"""
+    con = sqlite3.connect(DB, timeout=60)
+    feat_update(con); con.commit()
+    names = {"rev": "復活台風", "cin": "越境台風（東経180度の東から入った）", "cout": "東経180度を越えて東へ抜けた",
+             "lp": "ループ・迷走", "ri": "急発達（24時間で30kt以上）"}
+    for k, cond in TAGS.items():
+        rows = con.execute(f"SELECT title, rev, rev_a, rev_t, ri FROM tv WHERE {cond} ORDER BY year, number").fetchall()
+        print(f"\n== {names[k]}: {len(rows)}個")
+        for t, n, a, b, ri in rows:
+            extra = f"  復活{n}回 {jst(a):%m/%d %H時}→{jst(b):%m/%d %H時}（日本時間）" if k == "rev" else (f"  +{ri}kt/24h" if k == "ri" else "")
+            print("  ", t + extra)
+    n = con.execute("SELECT COUNT(*) FROM typhoons").fetchone()[0]
+    print(f"\n台風 {n}個 / 移動距離の平均 {con.execute('SELECT AVG(dist) FROM feat').fetchone()[0]:.0f}km")
+    con.close()
+
 def refresh_recent():
     """今年の台風を取り込む。PDFとJSONは別々に失敗しても、取れたぶんで動かす。"""
     con, ok = None, False
@@ -408,6 +555,10 @@ def refresh_recent():
         except Exception as e:
             print("JMA live failed:", repr(e), flush=True)
         dedupe(con)
+        try:
+            feat_update(con)
+        except Exception as e:
+            print("feat failed:", repr(e), flush=True)
         if ok:
             con.execute("INSERT OR REPLACE INTO meta VALUES('jma_at',?)", (datetime.now(timezone.utc).strftime(F),))
         con.commit()
@@ -529,6 +680,8 @@ def fdiag(P=print, storms=None):
 async def lifespan(_):
     if not os.path.exists(DB):
         await asyncio.to_thread(build)
+    else:
+        await asyncio.to_thread(feat_init)  # 旧DBに特徴量テーブルが無ければここで作る
 
     async def loop():
         while True:  # 速報値・発生中の台風を定期的に再取得（既定60分。REFRESH_MINUTESで変更可）
@@ -575,7 +728,7 @@ def years():
 
 SORTS = {"number": "year {d}, number {d}", "date": "start_time {d}",
          "wind": "max_wind IS NULL, max_wind {d}", "pres": "min_pres IS NULL, min_pres {d}",
-         "days": "days {d}", "name": "name_en = '', name_en {d}"}
+         "days": "days {d}", "dist": "dist IS NULL, dist {d}", "name": "name_en = '', name_en {d}"}
 
 import math, json
 from fastapi import Depends
@@ -584,6 +737,7 @@ from fastapi.responses import Response, JSONResponse, RedirectResponse
 def flt(name: str | None = None, year_from: int | None = None, year_to: int | None = None,
         month: int | None = None, wind_min: float | None = None, wind_max: float | None = None,
         pres_max: float | None = None, days_min: float | None = None, named: bool = False,
+        dist_min: float | None = None, dist_max: float | None = None, tag: str | None = None,
         near: str | None = None):
     """絞り込み条件（一覧・重ね表示・統計で共通）→ (WHERE句, 引数)。near は 'lat,lon,km'"""
     where, args = [], []
@@ -599,6 +753,13 @@ def flt(name: str | None = None, year_from: int | None = None, year_to: int | No
     if pres_max is not None: add("min_pres<=?", pres_max)
     if days_min is not None: add("days>=?", days_min)
     if named: where.append("name_en<>''")
+    if dist_min is not None: add("dist>=?", dist_min)  # 移動距離[km]（各点を結んだ道のり）
+    if dist_max is not None: add("dist<=?", dist_max)
+    for t in (tag or "").split(","):  # めずらしい台風（復活 rev / 越境 cin / 域外へ cout / ループ lp / 急発達 ri）
+        t = t.strip()
+        if not t: continue
+        if t not in TAGS: raise HTTPException(422, "tag は rev,cin,cout,lp,ri のいずれかで指定してください")
+        where.append(TAGS[t])
     if near:
         try: la, lo, km = (float(x) for x in near.split(","))
         except ValueError: raise HTTPException(422, "near は lat,lon,km の形式で指定してください")
@@ -618,16 +779,19 @@ def flt(name: str | None = None, year_from: int | None = None, year_to: int | No
 def typhoons(fl=Depends(flt), sort: str = "number", order: str = "desc", limit: int = Query(300, le=1000)):
     w, args = fl
     ob = SORTS.get(sort, SORTS["number"]).format(d="ASC" if order == "asc" else "DESC")
-    total = q(f"SELECT COUNT(*) AS n FROM typhoons {w}", args)[0]["n"]
-    rows = q(f"SELECT * FROM typhoons {w} ORDER BY {ob} LIMIT ?", (*args, limit))
-    for r in rows: r["max_wind"] = to_ms(r["max_wind"])
+    total = q(f"SELECT COUNT(*) AS n FROM tv {w}", args)[0]["n"]
+    rows = q(f"SELECT * FROM tv {w} ORDER BY {ob} LIMIT ?", (*args, limit))
+    for r in rows:
+        r["tg"] = tags_of(r)
+        r["max_wind"] = to_ms(r["max_wind"])
+        r["ri"] = to_ms(r["ri"]) if r["ri"] else 0  # 24時間の最大増速（m/s）
     return {"total": total, "rows": rows}
 
 @app.get("/api/tracks")
 def tracks(fl=Depends(flt), limit: int = Query(300, le=600)):
     """条件に合う台風の進路をまとめて返す（地図への重ね表示用。点は間引く）"""
     w, args = fl
-    sub = f"SELECT sid, title, max_wind FROM typhoons {w} ORDER BY year DESC, number DESC LIMIT ?"
+    sub = f"SELECT sid, title, max_wind FROM tv {w} ORDER BY year DESC, number DESC LIMIT ?"
     ts = {r["sid"]: {"sid": r["sid"], "title": r["title"], "w": to_ms(r["max_wind"]), "p": []} for r in q(sub, (*args, limit))}
     for r in q(f"SELECT sid, lat, lon FROM points WHERE sid IN (SELECT sid FROM ({sub})) ORDER BY sid, time", (*args, limit)):
         ts[r["sid"]]["p"].append([round(r["lat"], 2), round(r["lon"], 2)])
@@ -637,7 +801,7 @@ def tracks(fl=Depends(flt), limit: int = Query(300, le=600)):
 @app.get("/api/stats")
 def stats(fl=Depends(flt)):
     w, args = fl
-    rows = q(f"SELECT year, month, max_wind, days, title FROM typhoons {w}", args)
+    rows = q(f"SELECT sid, year, month, max_wind, days, title, dist, rev, cin, cout, lp, ri FROM tv {w}", args)
     yrs, mon, cls = {}, [0] * 12, {}
     for r in rows:
         yrs[r["year"]] = yrs.get(r["year"], 0) + 1
@@ -647,7 +811,15 @@ def stats(fl=Depends(flt)):
         cls[k] = cls.get(k, 0) + 1
     ds = [r for r in rows if r["days"] is not None]
     mx = max(ds, key=lambda r: r["days"], default=None)
-    return {"total": len(rows), "months": mon, "classes": cls,
+    dd = [r for r in rows if r["dist"] is not None]
+    top = sorted(dd, key=lambda r: -r["dist"])[:5]
+    tg = {k: 0 for k in TAGS}
+    for r in rows:
+        for k in tags_of(r): tg[k] += 1
+    return {"total": len(rows), "months": mon, "classes": cls, "tags": tg,
+            "avg_dist": round(sum(r["dist"] for r in dd) / len(dd)) if dd else None,
+            "max_dist": round(top[0]["dist"]) if top else None,
+            "top_dist": [{"sid": r["sid"], "title": r["title"], "dist": round(r["dist"])} for r in top],
             "years": [[y, yrs.get(y, 0)] for y in range(min(yrs), max(yrs) + 1)] if yrs else [],
             "avg_days": round(sum(r["days"] for r in ds) / len(ds), 1) if ds else None,
             "max_row": {"title": mx["title"], "days": mx["days"]} if mx else None}
@@ -676,11 +848,12 @@ def sw(): return Response(SW, media_type="application/javascript", headers={"Cac
 
 @app.get("/api/typhoons/{sid}")
 def detail(sid: str):
-    t = q("SELECT * FROM typhoons WHERE sid=?", (sid,))
+    t = q("SELECT * FROM tv WHERE sid=?", (sid,))
     if not t: raise HTTPException(404, "台風が見つかりません")
     track = q("SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time", (sid,))
     for p in track: p["wind"] = to_ms(p["wind"])
-    return {**t[0], "max_wind": to_ms(t[0]["max_wind"]), "track": track}
+    r = t[0]; r["tg"] = tags_of(r)
+    return {**r, "max_wind": to_ms(r["max_wind"]), "ri": to_ms(r["ri"]) if r["ri"] else 0, "track": track}
 
 # ---------------- 予報モデル比較（別タブ /forecast）----------------
 import time as _t
@@ -1058,6 +1231,16 @@ summary{cursor:pointer;color:var(--sub);font-size:13px;padding:2px 0}
 .v{text-align:right;line-height:1.2}.v strong{font:700 20px "Space Grotesk",sans-serif}.v small{display:block;color:var(--sub);font-size:11px}
 footer{padding:8px 16px;border-top:1px solid var(--line);color:var(--sub);font-size:11px;flex:none}
 
+/* ---- めずらしい台風・移動距離 ---- */
+.k-rev{--tc:#d8b4fe;--tbg:#c084fc26}.k-cin{--tc:#6ee7b7;--tbg:#34d39926}.k-cout{--tc:#5eead4;--tbg:#2dd4bf26}.k-lp{--tc:#fcd34d;--tbg:#fbbf2426}.k-ri{--tc:#fda4af;--tbg:#fb718526}
+.t em.tg,.tgp{font-style:normal;margin-left:6px;padding:1px 6px;border-radius:99px;background:var(--tbg);color:var(--tc);font-size:10px;vertical-align:1px}
+.tgs{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.tgs .tgp{margin:0;padding:2px 9px;font-size:11px;vertical-align:baseline}
+.chl{flex:none;align-self:center;color:var(--sub);font-size:11px}
+.lg span[data-tg]{cursor:pointer}
+.rk{display:grid;gap:4px;margin:0;padding:0;list-style:none}
+.rk li{display:flex;justify-content:space-between;gap:10px;align-items:center;background:var(--s2);border-radius:10px;padding:8px 12px;font-size:13px;cursor:pointer}
+.rk li b{font:700 14px "Space Grotesk",system-ui,sans-serif;white-space:nowrap}
+
 /* ---- 予報 ---- */
 .sel{display:flex;gap:8px}.sel select{flex:1;min-width:0;height:44px;font-size:16px}
 .rw{display:flex;align-items:center;gap:10px}.rw .lb{font-size:12px;color:var(--sub);flex:none}
@@ -1199,7 +1382,9 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
     <div class="chips wide">
      <button type="button" class="chip" data-w="">全ての強さ</button><button type="button" class="chip" data-w="33">強い〜</button>
      <button type="button" class="chip" data-w="44">非常に強い〜</button><button type="button" class="chip" data-w="54">猛烈な</button></div>
-    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="name">名前順</option></select>
+    <div class="chips wide" id="tgChips" aria-label="めずらしい台風"><span class="chl">めずらしい</span><button type="button" class="chip" data-tg="rev">復活台風</button><button type="button" class="chip" data-tg="cin">越境台風</button><button type="button" class="chip" data-tg="cout">180度の東へ</button><button type="button" class="chip" data-tg="lp">迷走(ループ)</button><button type="button" class="chip" data-tg="ri">急発達</button></div>
+    <div class="note wide" id="tgNote" hidden></div>
+    <div class="sort wide"><select name="sort"><option value="number">号数順</option><option value="date">発生日順</option><option value="wind">最大風速順</option><option value="pres">最低気圧順</option><option value="days">継続日数順</option><option value="dist">移動距離順</option><option value="name">名前順</option></select>
      <button type="button" id="dir" title="昇順・降順">降順</button><input type="hidden" name="order" value="desc"></div>
     <details id="dPl"><summary>地点から探す（近くを通った台風）</summary><div class="pl2">
      <div class="btns"><button type="button" class="btn" id="tNear">現在地から</button><button type="button" class="btn" id="tPick">地図で指定</button><button type="button" class="btn" id="tClr" hidden>指定を解除</button></div>
@@ -1214,6 +1399,8 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
      <label>最大風速 m/s 以下<input type="number" inputmode="numeric" name="wind_max" min="0"></label>
      <label>最低気圧 hPa 以下<input type="number" inputmode="numeric" name="pres_max" placeholder="例: 930"></label>
      <label>継続日数 以上<input type="number" inputmode="decimal" name="days_min" min="0" step="0.5"></label>
+     <label>移動距離 km 以上<input type="number" inputmode="numeric" name="dist_min" min="0" placeholder="例: 6000"></label>
+     <label>移動距離 km 以下<input type="number" inputmode="numeric" name="dist_max" min="0" placeholder="例: 1500"></label>
      <label class="chk"><input type="checkbox" name="named">名前付きのみ</label>
      <button type="button" id="reset">条件をリセット</button>
     </div></details>
@@ -1222,7 +1409,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
   </header>
   <div id="meta"><span id="count"></span><span class="pill" id="upd"></span></div>
   <ul id="list"></ul>
-  <footer>出典: 気象庁（ベストトラック／位置表。IBTrACS経由）。風速は10分平均、時刻は日本時間。「速報」は速報値で後日修正されます。地図タイル: Esri。</footer>
+  <footer>出典: 気象庁（ベストトラック／位置表。IBTrACS経由）。風速は10分平均、時刻は日本時間。「速報」は速報値で後日修正されます。移動距離と、復活・越境・ループ・急発達の印は、各点の位置・風速からの自動判定（参考値）です。地図タイル: Esri。</footer>
  </section>
 
  <!-- 画面3: 統計 -->
@@ -1297,6 +1484,16 @@ $("#fit").onclick=()=>{if(tab=="fc")FC.fit();else if(cur)map.fitBounds(cur.bound
 // ================= 過去の台風 =================
 const K=w=>w==null?UNK:CLS.find(c=>w>=c[0]),col=w=>K(w)[2],cls=w=>K(w)[1];
 const spd=w=>w==null?"-":`${w}m/s`;
+// めずらしい台風（サーバー側で各台風の点列から自動判定）
+const TGN={rev:"復活台風",cin:"越境台風",cout:"180度の東へ抜けた台風",lp:"迷走（ループ）",ri:"急発達"};
+const TGS={rev:"復活",cin:"越境",cout:"域外へ",lp:"ループ",ri:"急発達"};
+const TGD={rev:"熱帯低気圧に弱まった後、同じ号数のまま再び台風（17m/s以上）になった",cin:"東経180度より東（ハリケーンなど）から北西太平洋に入って台風になった",cout:"東経180度を越えて、その東側（中部太平洋）へ進んだ",lp:"進路がほぼ1周するように回った",ri:"24時間で最大風速が約15m/s以上強まった"};
+const tags=new Set();
+const dst=n=>Math.round(n).toLocaleString();
+const tgTxt=(k,t)=>k=="rev"?`復活台風${t.rev>1?`（${t.rev}回）`:""}`:k=="ri"?`急発達（24時間で+${t.ri}m/s）`:TGN[k];
+function tgSync(){document.querySelectorAll("#tgChips [data-tg]").forEach(b=>b.classList.toggle("on",tags.has(b.dataset.tg)));
+  const n=$("#tgNote");n.hidden=!tags.size;n.textContent=[...tags].map(k=>TGN[k]+"＝"+TGD[k]).join(" ／ ")+(tags.size>1?"（全てに当てはまるもの）":"")}
+$("#tgChips").onclick=e=>{const b=e.target.closest("[data-tg]");if(!b)return;const k=b.dataset.tg;tags.has(k)?tags.delete(k):tags.add(k);tgSync();load()};
 const jst=(s,full)=>{const d=new Date(new Date(s.replace(" ","T")+"Z").getTime()+9*3600e3),z=n=>String(n).padStart(2,"0");
   return `${full?d.getUTCFullYear()+"/":""}${d.getUTCMonth()+1}/${d.getUTCDate()} ${z(d.getUTCHours())}時`};
 const f=$("#f"),chips=document.querySelectorAll(".chip[data-w]");
@@ -1328,8 +1525,9 @@ async function dbInit(){
   for(let m=1;m<=12;m++) f.month.add(new Option(m+"月",m));
   const sv=store.get();for(const k in sv) if(f[k]&&f[k].type!="checkbox") f[k].value=sv[k];  // 前回の絞り込みを復元
   f.named.checked=sv.named==="true";
+  (sv.tag||"").split(",").filter(k=>TGN[k]).forEach(k=>tags.add(k));tgSync();
   jmaAt=y.jma_at||"";if(jmaAt) $("#upd").innerHTML=`速報 <b>${jst(jmaAt)}</b> 更新`;
-  $("#reset").onclick=()=>{f.reset();f.order.value="desc";near=null;load()};
+  $("#reset").onclick=()=>{f.reset();f.order.value="desc";near=null;tags.clear();tgSync();load()};
   $("#dir").onclick=()=>{f.order.value=f.order.value=="desc"?"asc":"desc";load()};
   chips.forEach(c=>c.onclick=()=>{f.wind_min.value=c.dataset.w;f.wind_max.value="";load()});
   f.addEventListener("input",e=>{if(e.isComposing)return;clearTimeout(dbInit.t);dbInit.t=setTimeout(load,250)});
@@ -1339,8 +1537,9 @@ async function dbInit(){
 let ctl;
 async function load(){
   const p=new URLSearchParams();
-  for(const k of ["name","year_from","year_to","month","wind_min","wind_max","pres_max","days_min","sort","order","limit"]) if(f[k].value) p.set(k,f[k].value);
+  for(const k of ["name","year_from","year_to","month","wind_min","wind_max","pres_max","days_min","dist_min","dist_max","sort","order","limit"]) if(f[k].value) p.set(k,f[k].value);
   if(f.named.checked) p.set("named","true");
+  if(tags.size) p.set("tag",[...tags].join(","));
   store.set(Object.fromEntries(p));
   if(near)p.set("near",`${near[0]},${near[1]},${f.km.value}`);
   lastP=p;drawNear();if(ovOn)drawOverlay(p);if(tab=="st")loadStats();
@@ -1352,7 +1551,7 @@ async function load(){
     $("#count").classList.remove("busy");
     $("#count").textContent=total?`${total}件`+(total>rows.length?`中 ${rows.length}件を表示（件数を増やすか条件を絞ってください）`:""):"該当なし。条件を変えてください";
     $("#list").innerHTML=rows.map(r=>`<li data-sid="${esc(r.sid)}"><span class="bar" style="background:${col(r.max_wind)}"></span>
-     <div class="t"><b>${esc(r.title)}${r.prov?"<em>速報</em>":""}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日</span>
+     <div class="t"><b>${esc(r.title)}${r.prov?"<em>速報</em>":""}${(r.tg||[]).map(k=>`<em class="tg k-${k}">${TGS[k]}</em>`).join("")}</b><span>${jst(r.start_time,1)}〜 ／ ${r.days}日${r.dist!=null?` ／ ${dst(r.dist)}km`:""}</span>
      <div class="m"><i style="width:${Math.min(100,(r.max_wind||0)/0.67)}%;background:${col(r.max_wind)}"></i></div></div>
      <div class="v"><strong>${r.max_wind??"-"}</strong><small>m/s</small><small>${r.min_pres??"-"}hPa</small></div></li>`).join("");
     const on=curSid&&$(`#list li[data-sid="${CSS.escape(curSid)}"]`);if(on)on.classList.add("on");
@@ -1400,18 +1599,29 @@ async function show(sid,li,keep){
     L.circleMarker(ll[i],{radius:e?6:3,color:"#fff",weight:1,fillColor:col(p.wind),fillOpacity:1,interactive:false}).addTo(layer);
     L.circleMarker(ll[i],{radius:14,stroke:false,fillOpacity:0,bubblingMouseEvents:false}).on("click",()=>{stop();setPos(i)})
      .bindTooltip(`${i==0?"発生 ":e?"終了 ":""}${jst(p.time,1)}<br>${spd(p.wind)} / ${p.pres??"-"}hPa`).addTo(layer)});
+  if(t.rev_t){const ia=pts.findIndex(p=>p.time===t.rev_a),ib=pts.findIndex(p=>p.time===t.rev_t);
+    if(ia>=0&&ib>ia){L.polyline(ll.slice(ia,ib+1),{color:"#c084fc",weight:6,opacity:.55,dashArray:"2 8",lineCap:"round",interactive:false}).addTo(layer);
+      L.circleMarker(ll[ib],{radius:11,color:"#c084fc",weight:3,fillOpacity:0,interactive:false}).addTo(layer);
+      L.circleMarker(ll[ib],{radius:14,stroke:false,fillOpacity:0,bubblingMouseEvents:false}).bindTooltip(`再び台風に発達 ${jst(pts[ib].time,1)}`).addTo(layer)}}
+  if(t.cin||t.cout){const dl=180+360*Math.round((ll[0][1]-180)/360);
+    L.polyline([[-50,dl],[60,dl]],{color:"#c084fc",weight:1,opacity:.6,dashArray:"4 6",interactive:false}).addTo(layer)}
   const n=pts.length,W=300,xs=pts.map((_,i)=>n>1?i/(n-1)*W:0),mw=Math.max(1,...pts.map(p=>p.wind||0));
   const wl=pts.map((p,i)=>p.wind==null?null:`${xs[i].toFixed(1)},${(38-p.wind/mw*34).toFixed(1)}`).filter(Boolean).join(" ");
-  const dist=Math.round(ll.slice(1).reduce((s,p,i)=>s+km(ll[i],p),0)/10)*10;
+  const dist=Math.round((t.dist!=null?t.dist:ll.slice(1).reduce((s,p,i)=>s+km(ll[i],p),0))/10)*10;
+  const spdv=dist&&t.days>0?Math.round(dist/(t.days*24)):"-";
+  const tgl=(t.tg||[]).length?`<div class="tgs">${t.tg.map(k=>`<span class="tgp k-${k}" title="${esc(TGD[k])}">${esc(tgTxt(k,t))}</span>`).join("")}</div>`:"";
   cur={pts,ll,xs,i:0,bounds:L.latLngBounds(ll),mk:L.circleMarker(ll[0],{radius:9,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:.9,interactive:false}).addTo(layer)};
   const i=$("#info");i.hidden=false;
   i.innerHTML=`<div class="hd"><h2>${esc(t.title)}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2><button type="button" class="btn sm" data-a="close">閉じる</button></div>
    <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）${dist?` ・ 約${dist.toLocaleString()}km`:""}</div>
+   ${tgl}
    <div class="g"><div><small>最大風速</small><strong>${t.max_wind??"-"}<span> m/s</span></strong></div>
    <div><small>強さ</small><strong style="color:${col(t.max_wind)}">${cls(t.max_wind)}</strong></div>
    <div><small>最低気圧</small><strong>${t.min_pres??"-"}<span> hPa</span></strong></div>
-   <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div></div>
-   <div class="st"><b style="color:${col(t.max_wind)}">${cls(t.max_wind)}</b><span>最大 ${spd(t.max_wind)}</span><span>${t.min_pres??"-"}hPa</span><span>${t.days}日</span></div>
+   <div><small>継続</small><strong>${t.days}<span> 日</span></strong></div>
+   <div><small>移動距離</small><strong>${dist?dist.toLocaleString():"-"}<span> km</span></strong></div>
+   <div><small>平均の速さ</small><strong>${spdv}<span> km/h</span></strong></div></div>
+   <div class="st"><b style="color:${col(t.max_wind)}">${cls(t.max_wind)}</b><span>最大 ${spd(t.max_wind)}</span><span>${t.min_pres??"-"}hPa</span><span>${t.days}日</span>${dist?`<span>${dist.toLocaleString()}km</span>`:""}</div>
    <div class="pl"><button type="button" class="btn" id="play" data-a="play">再生</button><div class="chart"><div id="rd"></div>
     <svg viewBox="0 0 ${W} 40" preserveAspectRatio="none"><polyline points="${wl}" fill="none" stroke="${col(t.max_wind)}" stroke-width="2" vector-effect="non-scaling-stroke"/>
     <line id="cur" x1="0" x2="0" y1="0" y2="40" stroke="#fff" stroke-width="1" vector-effect="non-scaling-stroke"/></svg>
@@ -1453,6 +1663,9 @@ function condText(p){const a=[],g=k=>p.get(k);
   if(g("pres_max"))a.push(`最低気圧${g("pres_max")}hPa以下`);
   if(g("days_min"))a.push(`継続${g("days_min")}日以上`);
   if(g("named"))a.push("名前付きのみ");
+  if(g("dist_min"))a.push(`移動距離${g("dist_min")}km以上`);
+  if(g("dist_max"))a.push(`移動距離${g("dist_max")}km以下`);
+  if(g("tag"))a.push(g("tag").split(",").map(k=>TGN[k]||k).join("かつ"));
   if(g("near")){const[la,lo,k]=g("near").split(",");a.push(`地点（北緯${(+la).toFixed(1)}度・東経${(+lo).toFixed(1)}度）から${k}km以内`)}
   return a.length?a.join(" ／ "):"条件なし（全ての台風）"}
 let stSeq=0;
@@ -1461,17 +1674,25 @@ async function loadStats(){
   const q=new URLSearchParams(lastP);["limit","sort","order"].forEach(k=>q.delete(k));
   try{const s=await (await fetch("/api/stats?"+q)).json();if(my!=stSeq)return;
     const tot=s.total||1,ys=s.years,cl=[...CLS,UNK].map(c=>[c[1],s.classes[c[1]]||0,c[2]]).filter(c=>c[1]);
+    const tg=s.tags||{},tgh=Object.keys(TGN).map(k=>`<span class="k-${k}" data-tg="${k}"><i style="background:var(--tc)"></i>${TGN[k]} ${tg[k]||0}</span>`).join(""),
+      rk=(s.top_dist||[]).map((r,i)=>`<li data-sid="${esc(r.sid)}"><span>${i+1}. ${esc(r.title)}</span><b>${dst(r.dist)}km</b></li>`).join("");
     const bars=(a,c)=>{const mx=Math.max(1,...a.map(x=>x[1])),w=100/a.length;
       return `<svg class="bs" viewBox="0 0 100 40" preserveAspectRatio="none">${a.map((x,i)=>`<rect x="${(i*w+.15).toFixed(2)}" y="${(38-x[1]/mx*36).toFixed(2)}" width="${(w-.3).toFixed(2)}" height="${(x[1]/mx*36).toFixed(2)}" fill="${c}"><title>${x[0]}: ${x[1]}</title></rect>`).join("")}</svg>`};
     b.innerHTML=`<div class="cond"><div class="note">集計の対象（「過去の台風」で絞り込んだ条件）</div><b>${esc(condText(lastP))}</b><button type="button" class="btn sm" data-a="gotodb">条件を変更する</button></div>
      <div class="kpi"><div><small>台風の数</small><strong>${s.total}<span>個</span></strong></div><div><small>平均の継続日数</small><strong>${s.avg_days??"-"}<span>日</span></strong></div>
+      <div><small>平均の移動距離</small><strong>${s.avg_dist!=null?dst(s.avg_dist):"-"}<span>km</span></strong></div><div><small>最長の移動距離</small><strong>${s.max_dist!=null?dst(s.max_dist):"-"}<span>km</span></strong></div>
       <div class="w2"><small>最も長く続いた台風</small><strong style="font-size:14px">${s.max_row?esc(s.max_row.title)+"（"+s.max_row.days+"日）":"-"}</strong></div></div>
      <h3 class="sh">強さ別</h3><div class="cb">${cl.map(c=>`<i style="width:${c[1]/tot*100}%;background:${c[2]}"></i>`).join("")}</div>
      <div class="lg">${cl.map(c=>`<span><i style="background:${c[2]}"></i>${c[0]} ${c[1]}</span>`).join("")}</div>
+     <h3 class="sh">めずらしい台風（タップでその台風だけを一覧に表示）</h3><div class="lg">${tgh}</div>
+     ${rk?`<h3 class="sh">移動距離が長い台風 Top5</h3><ul class="rk">${rk}</ul>`:""}
      <h3 class="sh">月別の発生数</h3>${bars(s.months.map((n,i)=>[(i+1)+"月",n]),"#38bdf8")}<div class="ax"><span>1月</span><span>6月</span><span>12月</span></div>
      ${ys.length>1?`<h3 class="sh">年別の発生数</h3>${bars(ys,"#ff8a3d")}<div class="ax"><span>${ys[0][0]}</span><span>${ys[ys.length-1][0]}</span></div>`:""}`;
   }catch(e){if(my==stSeq)b.innerHTML='<p class="note">集計に失敗しました。時間をおいて再度お試しください</p>'}}
-$("#stBody").addEventListener("click",e=>{if(e.target.closest("[data-a=gotodb]"))setTab("db")});
+$("#stBody").addEventListener("click",e=>{
+  if(e.target.closest("[data-a=gotodb]"))return setTab("db");
+  const g=e.target.closest("[data-tg]");if(g){tags.clear();tags.add(g.dataset.tg);tgSync();setTab("db");load();if(mobile())openPanel();return}
+  const r=e.target.closest(".rk li");if(r){setTab("db");show(r.dataset.sid)}});
 
 // ================= 予報 =================
 // 表現のルール:  線と外側の輪の色 = 予報の出どころ(モデル) / 印の中の色と大きさ = 強さ / 円 = 単独モデル、菱形 = アンサンブル平均
@@ -1639,6 +1860,8 @@ if __name__ == "__main__":
         diag()
     elif len(sys.argv) > 1 and sys.argv[1] == "fdiag":
         fdiag()
+    elif len(sys.argv) > 1 and sys.argv[1] == "featdiag":
+        featdiag()
     else:
         import uvicorn
         uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
