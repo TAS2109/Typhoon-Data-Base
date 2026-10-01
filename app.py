@@ -7,6 +7,7 @@
 今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）＋デジタル台風（NII、PDF未掲載の消滅済み台風の補完）で随時更新する。
 データ出典: 気象庁 / IBTrACS / デジタル台風（国立情報学研究所・北本朗）
 画面: 1ページ・地図共有の3タブ構成（予報 / 過去の台風 / 統計）。旧 /forecast は /#fc へ転送。
+強風域・暴風域（気象庁ベストトラックの半径。IBTrACS由来の台風のみ）は radii テーブルに保存し、過去の台風タブで表示を切り替える。
 めずらしい台風（復活・越境・ループ・急発達）と移動距離は、各台風の点列から自動判定して feat テーブルに保存する。
   判定結果の確認:  python app.py featdiag
 """
@@ -55,11 +56,25 @@ def num(v):
     except (TypeError, ValueError):
         return None
 
+def rad_of(r):
+    """IBTrACSの1行 → (暴風域の向き, 長径, 短径, 強風域の向き, 長径, 短径)（半径は海里）。半径が1つも無ければ None。
+    向き: 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW 8=N 9=全方向（円）。長径が無い・0 の側は None にする。"""
+    out = []
+    for k in ("R50", "R30"):
+        d, lo, sh = (num(r.get(f"TOKYO_{k}_{x}")) for x in ("DIR", "LONG", "SHORT"))
+        if lo and lo > 0:
+            out += [int(d) if d is not None else 9, lo, sh if sh and sh > 0 else lo]
+        else:
+            out += [None, None, None]
+    return tuple(out) if out[1] or out[4] else None
+
 def jst(iso):
     return datetime.strptime(iso[:19], "%Y-%m-%d %H:%M:%S") + timedelta(hours=9)
 
 NEED = ("SID", "NAME", "ISO_TIME", "TRACK_TYPE", "TOKYO_LAT", "TOKYO_LON",
-        "TOKYO_GRADE", "TOKYO_WIND", "TOKYO_PRES")
+        "TOKYO_GRADE", "TOKYO_WIND", "TOKYO_PRES",
+        "TOKYO_R50_DIR", "TOKYO_R50_LONG", "TOKYO_R50_SHORT",
+        "TOKYO_R30_DIR", "TOKYO_R30_LONG", "TOKYO_R30_SHORT")  # 半径は海里。R50=暴風域(25m/s以上)、R30=強風域(15m/s以上)
 
 def load_rows():
     """CSVを流し読みし、必要な列だけの辞書を返す（列番号で読むのでDictReaderより高速）。"""
@@ -103,6 +118,7 @@ def build():
         start_time TEXT, end_time TEXT, max_wind REAL, min_pres REAL, month INT, days REAL, prov INT);
     CREATE TABLE points(sid TEXT, time TEXT, lat REAL, lon REAL, wind REAL, pres REAL);
     CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE radii(sid TEXT, time TEXT, d50 INT, l50 REAL, s50 REAL, d30 INT, l30 REAL, s30 REAL);
     """)
     con.executescript("PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF;")  # ビルド専用の一時DBなので高速化
     metas = []
@@ -111,7 +127,8 @@ def build():
         # 気象庁の階級が「台風の強さ(TS以上)」に一度でも達したものだけ採用（気象庁の台風の定義）
         ts = [x[5] for x in p]
         if any(ts):
-            metas.append(dict(m, t0=jst(p[ts.index(True)][0]), p=[x[:5] for x in p]))
+            metas.append(dict(m, t0=jst(p[ts.index(True)][0]), p=[x[:5] for x in p],
+                              rad=[(x[0], *x[6]) for x in p if x[6]]))
 
     cur, meta, pts = None, None, []  # IBTrACSはSIDごとに連続して並んでいる
     for r in load_rows():
@@ -129,7 +146,8 @@ def build():
             cur, pts = sid, []
         wind, pres = num(r.get("TOKYO_WIND")), num(r.get("TOKYO_PRES"))
         is_ts = (num(r.get("TOKYO_GRADE")) in (3, 4, 5, 7)) or (wind is not None and wind >= 34)
-        pts.append((r["ISO_TIME"], lat, lon, wind or None, pres or None, is_ts))
+        rd = rad_of(r)
+        pts.append((r["ISO_TIME"], lat, lon, wind or None, pres or None, is_ts, rd))
     if cur is not None:
         flush(meta, pts)
 
@@ -140,7 +158,8 @@ def build():
         y = m["t0"].year
         seq[y] = seq.get(y, 0) + 1
         insert(con, m["sid"], y, seq[y], m["en"], m["p"])
-    con.executescript("CREATE INDEX idx_points_sid ON points(sid); CREATE INDEX idx_ty_year ON typhoons(year, number);")
+        con.executemany("INSERT INTO radii VALUES(?,?,?,?,?,?,?,?)", [(m["sid"], *x) for x in m["rad"]])
+    con.executescript("CREATE INDEX idx_radii_sid ON radii(sid); CREATE INDEX idx_points_sid ON points(sid); CREATE INDEX idx_ty_year ON typhoons(year, number);")
     con.execute("INSERT INTO meta VALUES('built_at',?)", (datetime.now().strftime("%Y-%m-%d"),))
     feat_update(con, full=True)  # 移動距離・復活・越境などの特徴量
     con.commit(); con.close()
@@ -454,6 +473,10 @@ def dedupe(con):
     dup = ("SELECT t.sid FROM typhoons t WHERE t.sid NOT LIKE 'JMA%' AND t.name_en<>'' AND EXISTS "
            "(SELECT 1 FROM typhoons j WHERE j.sid LIKE 'JMA%' AND j.year=t.year AND j.name_en=t.name_en)")
     con.execute(f"DELETE FROM points WHERE sid IN ({dup})")
+    try:
+        con.execute(f"DELETE FROM radii WHERE sid IN ({dup})")
+    except sqlite3.OperationalError:
+        pass  # 半径テーブルが無い旧DB
     con.execute(f"DELETE FROM typhoons WHERE sid IN ({dup})")
 
 # ---------------- 特徴量（移動距離・復活・越境・ループ・急発達） ----------------
@@ -919,9 +942,20 @@ def detail(sid: str):
     t = q("SELECT * FROM tv WHERE sid=?", (sid,))
     if not t: raise HTTPException(404, "台風が見つかりません")
     track = q("SELECT time, lat, lon, wind, pres FROM points WHERE sid=? ORDER BY time", (sid,))
-    for p in track: p["wind"] = to_ms(p["wind"])
+    try:  # 強風域・暴風域（半径は海里→km）。データがある台風・時刻だけに付く。DB再構築前の旧DBでは空
+        rd = {x["time"]: [x["d50"], x["l50"], x["s50"], x["d30"], x["l30"], x["s30"]]
+              for x in q("SELECT * FROM radii WHERE sid=?", (sid,))}
+    except sqlite3.OperationalError:
+        rd = {}
+    for p in track:
+        p["wind"] = to_ms(p["wind"])
+        if p["time"] in rd:
+            x = rd[p["time"]]
+            p["r"] = [x[0], *(None if v is None else round(v * 1.852) for v in x[1:3]),
+                      x[3], *(None if v is None else round(v * 1.852) for v in x[4:6])]
     r = t[0]; r["tg"] = tags_of(r)
-    return {**r, "max_wind": to_ms(r["max_wind"]), "ri": to_ms(r["ri"]) if r["ri"] else 0, "track": track}
+    return {**r, "max_wind": to_ms(r["max_wind"]), "ri": to_ms(r["ri"]) if r["ri"] else 0, "track": track,
+            "has_r": any("r" in p for p in track)}
 
 # ---------------- 予報モデル比較（別タブ /forecast）----------------
 import time as _t
@@ -1302,6 +1336,7 @@ footer{padding:8px 16px;border-top:1px solid var(--line);color:var(--sub);font-s
 /* ---- めずらしい台風・移動距離 ---- */
 .k-rev{--tc:#d8b4fe;--tbg:#c084fc26}.k-cin{--tc:#6ee7b7;--tbg:#34d39926}.k-cout{--tc:#5eead4;--tbg:#2dd4bf26}.k-lp{--tc:#fcd34d;--tbg:#fbbf2426}.k-ri{--tc:#fda4af;--tbg:#fb718526}
 .t em.tg,.tgp{font-style:normal;margin-left:6px;padding:1px 6px;border-radius:99px;background:var(--tbg);color:var(--tc);font-size:10px;vertical-align:1px}
+.wzs{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px}.wzs .chip{font-size:11px;padding:4px 10px}.wzs .chip i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:-1px;background:var(--c)}
 .tgs{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.tgs .tgp{margin:0;padding:2px 9px;font-size:11px;vertical-align:baseline}
 .chl{flex:none;align-self:center;color:var(--sub);font-size:11px}
 .lg span[data-tg]{cursor:pointer}
@@ -1569,6 +1604,25 @@ const km=(a,b)=>{const r=Math.PI/180,dl=(b[1]-a[1])*r,p1=a[0]*r,p2=b[0]*r;
   return 6371*Math.acos(Math.min(1,Math.sin(p1)*Math.sin(p2)+Math.cos(p1)*Math.cos(p2)*Math.cos(dl)))};
 const layer=L.layerGroup(),nearL=L.layerGroup(),ovL=L.layerGroup();dbLayerList.push(layer,nearL,ovL);
 map.createPane("ov").style.zIndex=380;
+// 強風域・暴風域（気象庁ベストトラックの半径。データがある台風・時刻だけ）
+map.createPane("wz").style.zIndex=375;
+const wzL=L.layerGroup(),wzN=L.layerGroup();dbLayerList.push(wzL,wzN);
+const wz={r50:false,r30:false},WZC={r50:"#fb7185",r30:"#fbbf24"},WZN={r50:"暴風域",r30:"強風域"};
+const BR=[null,45,90,135,180,225,270,315,0];   // 向きコード 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW 8=N（0・9=円）
+// 長径の向きに最大半径、反対側に最小半径になるよう、方位ごとの半径をなめらかにつないだ形（簡易形状）
+function wzShape(la,lo,r,k){const o=k=="r50"?0:3,lg=r[o+1];if(!lg)return null;
+  const sh=r[o+2]||lg,b0=BR[r[o]],R=Math.PI/180,p1=la*R,g=[];
+  for(let a=0;a<360;a+=10){const rr=b0==null?lg:sh+(lg-sh)*(1+Math.cos((a-b0)*R))/2,d=rr/6371,t=a*R,
+      p2=Math.asin(Math.sin(p1)*Math.cos(d)+Math.cos(p1)*Math.sin(d)*Math.cos(t)),
+      dl=Math.atan2(Math.sin(t)*Math.sin(d)*Math.cos(p1),Math.cos(d)-Math.sin(p1)*Math.sin(p2));
+    g.push([p2/R,lo+dl/R])}
+  return g}
+function drawWz(){wzL.clearLayers();if(!cur)return;
+  cur.pts.forEach((p,i)=>{if(!p.r)return;["r30","r50"].forEach(k=>{if(!wz[k])return;const g=wzShape(cur.ll[i][0],cur.ll[i][1],p.r,k);
+    if(g)L.polygon(g,{pane:"wz",stroke:false,fillColor:WZC[k],fillOpacity:.07,interactive:false}).addTo(wzL)})})}
+function drawWzNow(){wzN.clearLayers();if(!cur)return;const p=cur.pts[cur.i];if(!p||!p.r)return;
+  ["r30","r50"].forEach(k=>{if(!wz[k])return;const g=wzShape(cur.ll[cur.i][0],cur.ll[cur.i][1],p.r,k);
+    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2,fillColor:WZC[k],fillOpacity:.14,interactive:false}).addTo(wzN)})}
 let first=true,cur=null,playT=null,near=null,pick=false,ovOn=false,lastP=new URLSearchParams();
 
 // 一覧パネル（スマホ: 下から出るシート）
@@ -1631,7 +1685,7 @@ function nav(d){const a=[...document.querySelectorAll("#list li")],i=a.findIndex
 addEventListener("keydown",e=>{if(tab!="db"||/INPUT|SELECT|TEXTAREA/.test(e.target.tagName))return;
   if(e.key=="ArrowDown"||e.key=="j"){e.preventDefault();nav(1)}else if(e.key=="ArrowUp"||e.key=="k"){e.preventDefault();nav(-1)}else if(e.key==" "&&cur){e.preventDefault();play()}});
 // 進行アニメーション
-function setPos(i){if(!cur)return;cur.i=i;const p=cur.pts[i];cur.mk.setLatLng(cur.ll[i]);
+function setPos(i){if(!cur)return;cur.i=i;const p=cur.pts[i];cur.mk.setLatLng(cur.ll[i]);drawWzNow();
   $("#scrub").value=i;$("#rd").textContent=`${jst(p.time,1)} ・ ${spd(p.wind)} ・ ${p.pres??"-"}hPa`;
   const c=$("#cur");if(c){c.setAttribute("x1",cur.xs[i]);c.setAttribute("x2",cur.xs[i])}
   if(tab!="db")return;
@@ -1648,6 +1702,8 @@ function csv(){if(!cur)return toast("台風を選択してください");
   const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["\ufeff"+rows.join("\n")],{type:"text/csv"}));a.download=nm+".csv";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1e3)}
 $("#info").addEventListener("click",e=>{const b=e.target.closest("[data-a]");if(!b)return;
   ({prev:()=>nav(-1),next:()=>nav(1),share,csv,play,list:openPanel,close:()=>{$("#info").hidden=true;stop()}})[b.dataset.a]()});
+$("#info").addEventListener("click",e=>{const b=e.target.closest("[data-wz]");if(!b)return;
+  const k=b.dataset.wz;wz[k]=!wz[k];b.classList.toggle("on",wz[k]);drawWz();drawWzNow()});
 let seq=0;
 async function show(sid,li,keep){
   const my=++seq;stop();curSid=sid;
@@ -1677,12 +1733,14 @@ async function show(sid,li,keep){
   const wl=pts.map((p,i)=>p.wind==null?null:`${xs[i].toFixed(1)},${(38-p.wind/mw*34).toFixed(1)}`).filter(Boolean).join(" ");
   const dist=Math.round((t.dist!=null?t.dist:ll.slice(1).reduce((s,p,i)=>s+km(ll[i],p),0))/10)*10;
   const spdv=dist&&t.days>0?Math.round(dist/(t.days*24)):"-";
+  const wzh=t.has_r?`<div class="wzs"><button type="button" class="chip${wz.r50?" on":""}" data-wz="r50" style="--c:${WZC.r50}"><i></i>暴風域（25m/s以上）</button><button type="button" class="chip${wz.r30?" on":""}" data-wz="r30" style="--c:${WZC.r30}"><i></i>強風域（15m/s以上）</button></div>
+   <div class="note" style="margin-top:4px">気象庁ベストトラックの半径から作図（データのある時刻のみ・簡易形状）。ONにすると軌跡に沿った範囲を重ね、今の位置は枠線で強調します。</div>`:"";
   const tgl=(t.tg||[]).length?`<div class="tgs">${t.tg.map(k=>`<span class="tgp k-${k}" title="${esc(TGD[k])}">${esc(tgTxt(k,t))}</span>`).join("")}</div>`:"";
   cur={pts,ll,xs,i:0,bounds:L.latLngBounds(ll),mk:L.circleMarker(ll[0],{radius:9,color:"#fff",weight:2,fillColor:"#38bdf8",fillOpacity:.9,interactive:false}).addTo(layer)};
   const i=$("#info");i.hidden=false;
   i.innerHTML=`<div class="hd"><h2>${esc(t.title)}${t.prov?'<span class="pill" style="margin-left:8px">速報値</span>':""}</h2><button type="button" class="btn sm" data-a="close">閉じる</button></div>
    <div class="sub">${jst(t.start_time,1)} 〜 ${jst(t.end_time,1)}（日本時間）${dist?` ・ 約${dist.toLocaleString()}km`:""}</div>
-   ${tgl}
+   ${tgl}${wzh}
    <div class="g"><div><small>最大風速</small><strong>${t.max_wind??"-"}<span> m/s</span></strong></div>
    <div><small>強さ</small><strong style="color:${col(t.max_wind)}">${cls(t.max_wind)}</strong></div>
    <div><small>最低気圧</small><strong>${t.min_pres??"-"}<span> hPa</span></strong></div>
@@ -1697,7 +1755,7 @@ async function show(sid,li,keep){
    <div class="acts"><button type="button" class="btn mo" data-a="list">一覧</button><button type="button" class="btn" data-a="prev">前へ</button><button type="button" class="btn" data-a="next">次へ</button><button type="button" class="btn" data-a="share">共有</button><button type="button" class="btn" data-a="csv">CSV</button></div>`;
   $("#scrub").oninput=e=>{stop();setPos(+e.target.value)};
   if(!keep&&tab=="db")map.fitBounds(cur.bounds,fitOpt());
-  setPos(0);
+  drawWz();setPos(0);
 }
 // ---- 地点から探す / 重ね表示 ----
 function drawNear(){nearL.clearLayers();$("#tNear").classList.toggle("on",!!near);$("#tClr").hidden=!near;
