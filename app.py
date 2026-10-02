@@ -1483,11 +1483,15 @@ def find_analogs(la, lo, doy, w, fc, n=5):
         if best is None: continue
         sc, p, d0, rms, fut = best
         th = [[round(x[1], 2), round(x[2], 2), to_ms(x[3])] for x in pts][::2]
+        wi = []  # 起点を0hとした前後の強さ推移 [[時間h, 風速m/s]]
+        for h in range(-48, 73, 6):
+            x = _at(pts, ts, p[0] + timedelta(hours=h))
+            wi.append([h, to_ms(x[2]) if x and x[2] else None])
         mi = min(range(len(th)), key=lambda i: (th[i][0] - p[1]) ** 2 + (th[i][1] - p[2]) ** 2)
         m = meta[sid]
         out.append({"sid": sid, "title": m["title"], "year": m["year"], "time": p[0].strftime(F), "lat": round(p[1], 1), "lon": round(p[2], 1),
                     "w": to_ms(p[3]), "d0": round(d0), "err": round(rms) if taus else None, "score": round(sc, 2),
-                    "max_wind": to_ms(m["max_wind"]), "min_pres": m["min_pres"], "fut": fut, "track": th, "mi": mi})
+                    "max_wind": to_ms(m["max_wind"]), "min_pres": m["min_pres"], "fut": fut, "wi": wi, "track": th, "mi": mi})
     return sorted(out, key=lambda r: r["score"])[:n]
 
 @app.get("/api/analogs")
@@ -1738,7 +1742,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
  <section id="s-fc" class="sec">
   <div class="pad">
    <div class="sel"><select id="fsel" aria-label="予報を見る台風"></select><button type="button" class="btn" id="frf">更新</button></div>
-   <div class="rw"><span class="lb">予報時間</span><button type="button" class="btn sm" id="play" aria-label="再生" style="padding:0 10px">▶</button><input id="tau" type="range" min="0" max="120" step="6" value="48" aria-label="予報時間"><b id="tv">+48h</b></div>
+   <div class="rw"><span class="lb">予報時間</span><button type="button" class="btn sm" id="fplay" aria-label="再生" style="padding:0 10px">▶</button><input id="tau" type="range" min="0" max="120" step="6" value="48" aria-label="予報時間"><b id="tv">+48h</b></div>
    <div id="fnote" class="note"></div>
   </div>
   <div class="scroll">
@@ -1751,7 +1755,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
    <h3 class="sh">ソース（タップで表示・非表示）</h3><div id="fchips"></div>
    <label class="chk"><input type="checkbox" id="mem" checked>アンサンブルの各メンバーの進路も表示</label>
    <h3 class="sh">似た過去の台風</h3>
-   <label class="chk" style="margin-top:0"><input type="checkbox" id="anOn" checked>地図に重ねる（細い線＝それまで、太い線＝その後）</label>
+   <label class="chk" style="margin-top:0"><input type="checkbox" id="anOn">地図に重ねる（線の色＝当時の強さ ／ 細い線＝それまで、太い線＝その後）</label>
    <div id="an"></div>
    <h3 class="sh">詳しく見る</h3>
    <div class="btns"><button type="button" class="btn" id="tbl">位置のばらつき表</button><button type="button" class="btn" id="int">強さ予報のグラフ</button></div>
@@ -2220,7 +2224,7 @@ function build(){
 }
 function apply(){items.forEach(it=>{const on=active&&it.visible;on?it.g.addTo(map):it.g.remove();
   if(it.mem)(on&&$("#mem").checked)?it.mem.addTo(map):it.mem.remove()});
-  document.querySelectorAll("#fchips .src").forEach(b=>b.classList.toggle("off",!items[+b.dataset.i].visible));(active&&$("#anOn").checked)?anL.addTo(map):anL.remove();marks()}
+  document.querySelectorAll("#fchips .src").forEach(b=>b.classList.toggle("off",!items[+b.dataset.i].visible));anShow();marks()}
 function marks(){tm.clearLayers();const t=+$("#tau").value,out=[];$("#tv").innerHTML=`+${t}h${base?`<small style="display:block;font-weight:400;font-size:11px;color:var(--sub)">${vt(base,t)}（日本時間）</small>`:""}`;
   items.forEach(it=>{if(!it.visible)return;const p=at(it.pts,t);if(!p)return;const q=atv(it.pts,t);
     mk(p[0],p[1],it.c,q[0],it.is10,{e:it.ens,cur:true}).addTo(tm);
@@ -2239,8 +2243,8 @@ $("#fchips").onclick=e=>{
   if(g){const a=items.filter(i=>i.grp==g.dataset.g),on=!a.some(i=>i.visible);a.forEach(i=>i.visible=on);apply();return}
   const b=e.target.closest(".src");if(!b)return;const it=items[+b.dataset.i];it.visible=!it.visible;apply()};
 $("#mem").onchange=apply;$("#anOn").onchange=apply;$("#tau").oninput=()=>{stopPlay();marks()};
-function stopPlay(){if(pt){clearInterval(pt);pt=null}$("#play").textContent="▶"}
-$("#play").onclick=()=>{if(pt)return stopPlay();const s=$("#tau");if(+s.value>=+s.max)s.value=0;$("#play").textContent="⏸";marks();
+function stopPlay(){if(pt){clearInterval(pt);pt=null}$("#fplay").textContent="▶"}
+$("#fplay").onclick=()=>{if(pt)return stopPlay();const s=$("#tau");if(+s.value>=+s.max)s.value=0;$("#fplay").textContent="⏸";marks();
   pt=setInterval(()=>{const n=+s.value+6;if(n>+s.max)return stopPlay();s.value=n;marks()},700)};
 const tog=(id,k)=>$(id).onclick=e=>{opt[k]=!opt[k];e.currentTarget.classList.toggle("on",opt[k]);redraw()};
 tog("#oInlay","inlay");tog("#oNum","num");
@@ -2307,21 +2311,33 @@ async function loadAn(){const my=++anSeq,r=refItem();an=[];anSel=-1;anL.clearLay
   const fc=[24,48,72].map(t=>{const p=at(r.pts,t);return p?`${t}:${p[0].toFixed(1)}:${p[1].toFixed(1)}`:""}).filter(Boolean).join(",");
   try{const x=await fetch(`/api/analogs?lat=${a0[0]}&lon=${a0[1]}&doy=${doy}&w=${(wd||0).toFixed(0)}&fc=${fc}&n=5`);if(!x.ok)throw 0;const j=await x.json();if(my!=anSeq)return;an=j;anList();drawAn()}
   catch(e){if(my==anSeq)$("#an").innerHTML='<p class="note">似た台風を取得できませんでした</p>'}}
+const wc=v=>v==null?UNKF[2]:(FCLS.find(c=>v>=c[0])||FCLS[4])[2];
+function anChart(a,rs){  // 当時の強さの推移（細線=当時、破線=今回の予報）。起点=0h
+  const X=h=>(h+48)/120*200,mx=Math.max(60,...a.wi.map(x=>x[1]||0),...rs.map(x=>x[1])),Y=v=>(44-v/mx*40).toFixed(1);
+  const g=[33,44,54].filter(v=>v<mx).map(v=>`<line x1="0" x2="200" y1="${Y(v)}" y2="${Y(v)}" stroke="${wc(v)}" stroke-opacity=".35" stroke-width="1" vector-effect="non-scaling-stroke"/>`).join("");
+  let seg="";for(let i=1;i<a.wi.length;i++){const p=a.wi[i-1],q=a.wi[i];if(p[1]==null||q[1]==null)continue;
+    seg+=`<line x1="${X(p[0]).toFixed(1)}" y1="${Y(p[1])}" x2="${X(q[0]).toFixed(1)}" y2="${Y(q[1])}" stroke="${wc(q[1])}" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke"/>`}
+  const fl=rs.length>1?`<polyline points="${rs.map(x=>X(x[0]).toFixed(1)+","+Y(x[1])).join(" ")}" fill="none" stroke="#fff" stroke-width="1.5" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>`:"";
+  return `<svg viewBox="0 0 200 48" preserveAspectRatio="none" style="width:100%;height:46px;margin-top:4px;display:block"><line x1="${X(0)}" x2="${X(0)}" y1="0" y2="48" stroke="#8b9bbb" stroke-width="1" vector-effect="non-scaling-stroke"/>${g}${seg}${fl}</svg>
+   <div class="note" style="display:flex;justify-content:space-between"><span>-48h</span><span>起点</span><span>+72h</span></div>`}
 function anList(){
   if(!an.length){$("#an").innerHTML='<p class="note">近い動きをした過去の台風は見つかりませんでした</p>';return}
+  const r=refItem(),rs=r?r.pts.filter(p=>p[0]<=72&&p[3]).map(p=>[p[0],w10(p[3],r.is10)]):[];
   $("#an").innerHTML=an.map((a,i)=>{const f=a.fut.find(x=>x[0]==72)||a.fut[a.fut.length-1],p=[a.lat,a.lon];
-    const fu=f?`その後${f[0]}h: ${dirj(brg(p,[f[1],f[2]]))}へ約${r10(km(p,[f[1],f[2]]))}km${a.w!=null&&f[3]!=null?` ・ ${a.w}→${f[3]}m/s`:""}`:"";
+    const fu=f?`その後${f[0]}h: ${dirj(brg(p,[f[1],f[2]]))}へ約${r10(km(p,[f[1],f[2]]))}km`:"";
+    const after=a.wi.filter(x=>x[0]>=0&&x[1]!=null),pk=after.reduce((m,x)=>!m||x[1]>m[1]?x:m,null);
+    const it=`起点 ${a.w??"-"}m/s${pk?` → その後のピーク ${pk[1]}m/s（${cls(pk[1])}・+${pk[0]}h）`:""}`;
     return `<button type="button" class="anr${i==anSel?" on":""}" data-i="${i}"><b>${esc(a.title)}</b>
      <small>${a.time.slice(0,4)}年${+a.time.slice(5,7)}/${+a.time.slice(8,10)}時点 ${a.lat}N ${a.lon}E ・ 位置差${a.d0}km${a.err!=null?` ・ 進路差${a.err}km`:""}</small>
-     <small>${fu}${fu?" ・ ":""}最大${a.max_wind??"-"}m/s${a.min_pres?` ${Math.round(a.min_pres)}hPa`:""}</small></button>`}).join("")+
-    '<div class="note" style="margin-top:6px">現在位置・予報の動き・季節・強さが近い過去の台風です。同じ経過をたどるとは限らない参考表示です（気象庁ベストトラック準拠）。</div>'}
+     <small>${it}</small><small>${fu}${fu?" ・ ":""}生涯の最大 ${a.max_wind??"-"}m/s${a.min_pres?` ${Math.round(a.min_pres)}hPa`:""}</small>${anChart(a,rs)}</button>`}).join("")+
+    '<div class="note" style="margin-top:6px">現在位置・予報の動き・季節・強さが近い過去の台風です。グラフの細い線＝当時の風速、白い破線＝今回の予報（'+esc(r?r.label:"")+'）。同じ経過をたどるとは限らない参考表示です（気象庁ベストトラック準拠）。</div>'}
 function anLL(a){const sh=360*Math.round((ref-a.lon)/360);let pv=null;return a.track.map(([la,lo])=>{lo+=sh;if(pv!==null){while(lo-pv>180)lo-=360;while(lo-pv<-180)lo+=360}pv=lo;return[la,lo]})}
-function drawAn(){anL.clearLayers();an.forEach((a,i)=>{const on=i==anSel,ll=anLL(a),tip=`${a.title}（${a.time.slice(0,4)}年）`,sh=360*Math.round((ref-a.lon)/360);
-  const go=()=>selAn(i);
-  L.polyline(ll.slice(0,a.mi+1),{color:"#cbd5e1",weight:on?2:1.5,opacity:on?.7:.35}).bindTooltip(esc(tip)).on("click",go).addTo(anL);
-  L.polyline(ll.slice(a.mi),{color:on?"#ffffff":"#cbd5e1",weight:on?4:2.5,opacity:on?1:.75}).bindTooltip(esc(tip)).on("click",go).addTo(anL);
-  L.circleMarker([a.lat,a.lon+sh],{radius:5,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip(esc(tip)+" 比較の起点").on("click",go).addTo(anL)})}
-function selAn(i){anSel=i;anList();drawAn();const a=an[i];if(a)map.fitBounds(L.latLngBounds(anLL(a)),pad())}
+function anShow(){(active&&$("#anOn").checked)?anL.addTo(map):anL.remove()}
+function drawAn(){anL.clearLayers();an.forEach((a,i)=>{const on=i==anSel,ll=anLL(a),tip=`${a.title}（${a.time.slice(0,4)}年）`,sh=360*Math.round((ref-a.lon)/360),go=()=>selAn(i);
+  for(let k=1;k<ll.length;k++){const aft=k>a.mi,v=a.track[k][2];  // 線の色=当時の強さ。起点より前は細く薄く、その後は太く
+    L.polyline([ll[k-1],ll[k]],{color:wc(v),weight:aft?(on?5:3):(on?2.5:1.5),opacity:aft?(on?1:.8):(on?.6:.3),lineCap:"round"}).bindTooltip(esc(tip)+(v!=null?` ${v}m/s`:"")).on("click",go).addTo(anL)}
+  L.circleMarker([a.lat,a.lon+sh],{radius:on?7:5,color:"#fff",weight:2,fillColor:wc(a.w),fillOpacity:1}).bindTooltip(esc(tip)+" 比較の起点"+(a.w!=null?` ${a.w}m/s`:"")).on("click",go).addTo(anL)})}
+function selAn(i){anSel=i;$("#anOn").checked=true;anShow();anList();drawAn();const a=an[i];if(a)map.fitBounds(L.latLngBounds(anLL(a)),pad())}
 $("#an").onclick=e=>{const b=e.target.closest(".anr");if(b)selAn(+b.dataset.i)};
 // 読み込み
 async function load(){const o=$("#fsel").selectedOptions[0];if(!o)return;setNote("読み込み中…");
