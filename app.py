@@ -7,6 +7,8 @@
 今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）＋デジタル台風（NII、PDF未掲載の消滅済み台風の補完）で随時更新する。
 データ出典: 気象庁 / IBTrACS / デジタル台風（国立情報学研究所・北本朗）
 画面: 1ページ・地図共有の3タブ構成（予報 / 過去の台風 / 統計）。旧 /forecast は /#fc へ転送。
+統計タブ: 概要（今年の発生ペース・強さ別・風速分布）/ 推移（年別・年代別）/ 季節（月別）/ 記録（Top10）の4サブタブ。
+  グラフをなぞると内訳が出て、年・月・強さ・風速帯をタップすると「過去の台風」へ絞り込んで移る。集計対象は「過去の台風」の絞り込み条件と共通。
 強風域・暴風域（気象庁の半径）は radii テーブルに保存し、過去の台風タブで表示する（既定ON）。
   過去の台風は IBTrACS（ベストトラック）、今年の台風は位置表PDF（速報・確定）と防災情報JSONの実況から取り込む。予報には付けない。
 めずらしい台風（復活・越境・ループ・急発達）と移動距離は、各台風の点列から自動判定して feat テーブルに保存する。
@@ -1054,33 +1056,74 @@ def tracks(fl=Depends(flt), limit: int = Query(300, le=600)):
     for t in ts.values(): t["p"] = t["p"][::2] + ([t["p"][-1]] if len(t["p"]) % 2 == 0 else [])
     return list(ts.values())
 
+def _ci(v):
+    """風速(m/s) → 強さ階級の番号（0=猛烈な 1=非常に強い 2=強い 3=台風 4=それ以下・不明）"""
+    return 4 if v is None else 0 if v >= 54 else 1 if v >= 44 else 2 if v >= 33 else 3 if v >= 17 else 4
+
+def _pace():
+    """今年の発生ペース。平年（1991〜2020年）の「同じ月日までの発生数」と比べる。絞り込み条件とは無関係。
+    平年のぶんのデータが足りなければ None。"""
+    now = datetime.now(timezone.utc) + timedelta(hours=9)
+    y, md = now.year, now.strftime("%m-%d")
+    cnt = {}  # 年 -> [同じ月日までの数, 年間の数]
+    for r in q("SELECT year, substr(datetime(start_time,'+9 hours'),6,5) AS md FROM typhoons WHERE year<=?", (y,)):
+        c = cnt.setdefault(r["year"], [0, 0])
+        c[1] += 1
+        if r["md"] <= md: c[0] += 1
+    base = range(1991, 2021)
+    if sum(1 for k in base if k in cnt) < 25: return None
+    n = cnt.get(y, [0, 0])[0]
+    others = [v[0] for k, v in cnt.items() if k != y]
+    return {"year": y, "md": f"{now.month}/{now.day}", "n": n,
+            "normal": round(sum(cnt.get(k, [0, 0])[0] for k in base) / 30, 1),
+            "full_normal": round(sum(cnt.get(k, [0, 0])[1] for k in base) / 30, 1),
+            "rank": 1 + sum(1 for v in others if v > n), "of": len(others) + 1}
+
 @app.get("/api/stats")
-def stats(fl=Depends(flt)):
+def stats(fl=Depends(flt), year_from: int | None = None, year_to: int | None = None):
+    """統計タブ用の集計。絞り込み条件は一覧と共通。"""
     w, args = fl
-    rows = q(f"SELECT sid, year, month, max_wind, days, title, dist, rev, cin, cout, lp, ri, r30 FROM tv {w}", args)
-    yrs, mon, cls = {}, [0] * 12, {}
+    rows = q(f"SELECT sid, year, month, max_wind, min_pres, days, title, dist, r30, rev, cin, cout, lp, ri FROM tv {w}", args)
+    span = q("SELECT MIN(year) AS a, MAX(year) AS b FROM typhoons")[0]
+    lo, hi = (year_from or span["a"]), (year_to or span["b"])
+    cur = (datetime.now(timezone.utc) + timedelta(hours=9)).year  # 途中の年は平均から外すため、クライアントへ渡す
+    yr = {y: [0, 0, 0, 0.0, 0] for y in range(lo, hi + 1)} if lo is not None and hi is not None else {}  # 年 -> [数, 強い以上, 非常に強い以上, 風速の合計, 風速ありの数]
+    mon = [[0] * 5 for _ in range(12)]
+    cls, hist = {}, {b: 0 for b in [0] + list(range(15, 71, 5))}
     for r in rows:
-        yrs[r["year"]] = yrs.get(r["year"], 0) + 1
-        if r["month"] and 1 <= r["month"] <= 12: mon[r["month"] - 1] += 1
-        v = to_ms(r["max_wind"])
+        v = to_ms(r["max_wind"]); c = _ci(v)
+        e = yr.setdefault(r["year"], [0, 0, 0, 0.0, 0])
+        e[0] += 1
+        if c <= 2: e[1] += 1
+        if c <= 1: e[2] += 1
+        if v is not None:
+            e[3] += v; e[4] += 1
+            hist[0 if v < 15 else min(70, v // 5 * 5)] += 1
+        if r["month"] and 1 <= r["month"] <= 12: mon[r["month"] - 1][c] += 1
         k = "不明" if v is None else next(n for t, n in ((54, "猛烈な"), (44, "非常に強い"), (33, "強い"), (17, "台風"), (0, "熱帯低気圧")) if v >= t)
         cls[k] = cls.get(k, 0) + 1
-    ds = [r for r in rows if r["days"] is not None]
-    mx = max(ds, key=lambda r: r["days"], default=None)
-    dd = [r for r in rows if r["dist"] is not None]
-    top = sorted(dd, key=lambda r: -r["dist"])[:5]
-    big = sorted((r for r in rows if r["r30"]), key=lambda r: -r["r30"])[:5]
+    ds = [r["days"] for r in rows if r["days"] is not None]
+    dd = [r["dist"] for r in rows if r["dist"] is not None]
+    full = [v[0] for y, v in yr.items() if y != cur]  # 年平均は、まだ終わっていない今年を除く
     tg = {k: 0 for k in TAGS}
     for r in rows:
         for k in tags_of(r): tg[k] += 1
-    return {"total": len(rows), "months": mon, "classes": cls, "tags": tg,
-            "avg_dist": round(sum(r["dist"] for r in dd) / len(dd)) if dd else None,
-            "max_dist": round(top[0]["dist"]) if top else None,
-            "top_size": [{"sid": r["sid"], "title": r["title"], "r30": round(r["r30"])} for r in big],
-            "top_dist": [{"sid": r["sid"], "title": r["title"], "dist": round(r["dist"])} for r in top],
-            "years": [[y, yrs.get(y, 0)] for y in range(min(yrs), max(yrs) + 1)] if yrs else [],
-            "avg_days": round(sum(r["days"] for r in ds) / len(ds), 1) if ds else None,
-            "max_row": {"title": mx["title"], "days": mx["days"]} if mx else None}
+    def top(items, val, **ex):
+        return [{"sid": r["sid"], "title": r["title"], "v": val(r), **{k: f(r) for k, f in ex.items()}} for r in items[:10]]
+    wv = sorted((r for r in rows if r["max_wind"] is not None), key=lambda r: (-r["max_wind"], r["min_pres"] or 9999))
+    pv = sorted((r for r in rows if r["min_pres"]), key=lambda r: (r["min_pres"], -(r["max_wind"] or 0)))
+    rec = {"wind": top(wv, lambda r: to_ms(r["max_wind"]), p=lambda r: round(r["min_pres"]) if r["min_pres"] else None),
+           "pres": top(pv, lambda r: round(r["min_pres"]), w=lambda r: to_ms(r["max_wind"])),
+           "days": top(sorted((r for r in rows if r["days"] is not None), key=lambda r: -r["days"]), lambda r: r["days"]),
+           "dist": top(sorted((r for r in rows if r["dist"] is not None), key=lambda r: -r["dist"]), lambda r: round(r["dist"])),
+           "size": top(sorted((r for r in rows if r["r30"]), key=lambda r: -r["r30"]), lambda r: round(r["r30"]))}
+    return {"total": len(rows), "classes": cls, "tags": tg, "months": [sum(m) for m in mon], "mon_cls": mon,
+            "years": [[y, *v[:3], round(v[3], 1), v[4]] for y, v in sorted(yr.items())],
+            "wind_hist": sorted(hist.items()), "cur_year": cur,
+            "avg_per_year": round(sum(full) / len(full), 1) if full else None,
+            "avg_days": round(sum(ds) / len(ds), 1) if ds else None,
+            "avg_dist": round(sum(dd) / len(dd)) if dd else None,
+            "rec": rec, "pace": _pace()}
 
 # ---- PWA（ホーム画面に追加・オフライン時は直近のデータを表示）----
 ICON = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#0a1120"/>'
@@ -1657,6 +1700,27 @@ footer{padding:8px 16px;border-top:1px solid var(--line);color:var(--sub);font-s
 .bs{width:100%;height:90px;display:block;background:var(--s2);border-radius:10px}.ax{display:flex;justify-content:space-between;color:var(--sub);font-size:11px;margin-top:2px}
 .cb{display:flex;height:14px;border-radius:7px;overflow:hidden;background:var(--s2)}.cb i{display:block}
 .lg{display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:6px;font-size:12px}.lg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:4px}
+.segw{position:sticky;top:0;z-index:3;background:var(--s1);padding:10px 0 6px;margin-top:4px}
+.seg{display:flex;gap:4px;background:var(--s2);padding:3px;border-radius:12px}
+.seg button{flex:1;height:34px;border:0;border-radius:9px;background:none;color:var(--sub);font-size:13px;font-weight:700;cursor:pointer}
+.seg button[aria-selected=true]{background:var(--acc);color:#04121f}
+.pace{background:var(--s2);border-radius:12px;padding:10px 12px;margin-top:10px}
+.pace small{display:block;color:var(--sub);font-size:11px;line-height:1.6}
+.pv{display:flex;align-items:baseline;gap:4px 10px;flex-wrap:wrap;margin:2px 0 8px}
+.pv strong{font:700 26px "Space Grotesk",system-ui,sans-serif}.pv strong span{font-size:12px;font-weight:400;color:var(--sub);margin-left:3px}
+.pv em{font-style:normal;font-size:12px;color:var(--sub)}.pv b.up{color:#ff8a3d}.pv b.dn{color:#4fc3f7}
+.pb{position:relative;height:8px;border-radius:4px;background:var(--bg);margin-bottom:8px}.pb i{display:block;height:100%;border-radius:4px;background:var(--acc)}
+.pb u{position:absolute;top:-3px;width:2px;height:14px;background:#fff;text-decoration:none}
+.ch{display:block;width:100%;height:auto;touch-action:pan-y;-webkit-user-select:none;user-select:none}
+.ch .hl{fill:#fff;opacity:0}.ch .hl.on{opacity:.12}
+.rd{min-height:46px;margin-top:6px;font-size:12px;line-height:1.8}.rd b{font-size:13px}.rd .btn{margin-left:6px;vertical-align:middle}
+.tb{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+.tb th{color:var(--sub);font-weight:400;font-size:11px;text-align:right;padding:4px 6px}.tb td{text-align:right;padding:7px 6px;border-top:1px solid var(--line)}
+.tb th:first-child,.tb td:first-child{text-align:left}
+.hs{display:grid;grid-template-columns:repeat(12,1fr);gap:2px}.hs div{border-radius:6px;padding:4px 0;text-align:center}
+.hs small{display:block;font-size:9px;color:var(--sub)}.hs b{font-size:11px}
+.lg [data-dr]{cursor:pointer}
+.lk{display:inline-block;width:14px;height:0;border-top:2px dashed #fff;margin-right:4px;vertical-align:middle}
 
 /* ---- 地図まわり ---- */
 main{position:relative;min-height:0}#map{height:100%;background:#0b1522;z-index:0}
@@ -2122,31 +2186,111 @@ function condText(p){const a=[],g=k=>p.get(k);
   if(g("tag"))a.push(g("tag").split(",").map(k=>TGN[k]||k).join("かつ"));
   if(g("near")){const[la,lo,k]=g("near").split(",");a.push(/^r\d+$/.test(k)?`地点（北緯${(+la).toFixed(1)}度・東経${(+lo).toFixed(1)}度）が${WZN[k]}に入った`:`地点（北緯${(+la).toFixed(1)}度・東経${(+lo).toFixed(1)}度）から${k}km以内`)}
   return a.length?a.join(" ／ "):"条件なし（全ての台風）"}
-let stSeq=0;
+let stSeq=0,stD=null,stSub="ov",stRec="wind",stCh={},stSel={};
+const STS=[["ov","概要"],["tr","推移"],["se","季節"],["rc","記録"]];
+const RECS=[["wind","風速"],["pres","気圧"],["days","継続"],["dist","距離"],["size","強風域"]];
+const RECN={wind:"最大風速（10分平均）。同じ風速なら気圧が低い順",pres:"最低中心気圧",days:"発生から消滅までの日数",dist:"各点を結んだ道のり",size:"強風域（15m/s以上）の最大半径。半径のデータがある台風のみ"};
+const CW=[{wind_min:54,wind_max:""},{wind_min:44,wind_max:53},{wind_min:33,wind_max:43},{wind_min:17,wind_max:32},{wind_min:"",wind_max:16}];  // 強さ階級ごとの風速の範囲
+const SC=CLS.map(c=>c[2]);
+const pct=(a,b)=>b?Math.round(a/b*100):0;
+function drill(o){for(const k in o)f[k].value=o[k];setTab("db");load();if(mobile())openPanel()}
+// 積み上げ棒グラフ。data=[{x:軸ラベル,p:[値…(下から)],c:[色…]}]、o={c:既定の色,line:[折れ線の値…],h:高さ}
+function stChart(id,data,o){
+  const W=320,H=o.h||150,ml=28,mr=4,mt=8,mb=18,iw=W-ml-mr,ih=H-mt-mb,n=data.length,bw=iw/n,
+    m0=Math.max(1,...data.map(d=>d.p.reduce((a,b)=>a+b,0)),...(o.line||[]).map(v=>v||0)),
+    st=[1,2,5,10,20,50,100,200,500,1000].find(s=>m0/s<=4)||1000,mx=Math.ceil(m0/st)*st,Y=v=>mt+ih-v/mx*ih;
+  let g="";
+  for(let v=0;v<=mx;v+=st)g+=`<line x1="${ml}" x2="${W-mr}" y1="${Y(v).toFixed(1)}" y2="${Y(v).toFixed(1)}" stroke="#22314f"/><text x="${ml-4}" y="${(Y(v)+3).toFixed(1)}" text-anchor="end" font-size="9" fill="#8b9bbb">${v}</text>`;
+  data.forEach((d,i)=>{const x=ml+i*bw,gap=Math.min(1.5,bw*.12);let b=0;
+    g+=`<rect class="hl" x="${x.toFixed(2)}" y="${mt}" width="${bw.toFixed(2)}" height="${ih}"/>`;
+    d.p.forEach((v,k)=>{if(!v)return;const y0=Y(b+v),h=Y(b)-y0;b+=v;
+      g+=`<rect x="${(x+gap).toFixed(2)}" y="${y0.toFixed(2)}" width="${Math.max(.5,bw-gap*2).toFixed(2)}" height="${h.toFixed(2)}" fill="${(d.c||o.c)[k]}"/>`});
+    if(d.x!=="")g+=`<text x="${(x+bw/2).toFixed(1)}" y="${H-5}" text-anchor="middle" font-size="9" fill="#8b9bbb">${d.x}</text>`});
+  if(o.line){const pts=o.line.map((v,i)=>v==null?null:`${(ml+i*bw+bw/2).toFixed(1)},${Y(v).toFixed(1)}`).filter(Boolean);
+    if(pts.length>1)g+=`<polyline points="${pts.join(" ")}" fill="none" stroke="#fff" stroke-width="1.6" stroke-dasharray="4 3" stroke-linejoin="round"/>`}
+  return `<svg class="ch" data-ch="${id}" data-n="${n}" viewBox="0 0 ${W} ${H}">${g}</svg><div class="rd" id="rd-${id}"></div>`}
+function stPick(e){const sv=e.target.closest&&e.target.closest("svg.ch");if(!sv)return;
+  const r=sv.getBoundingClientRect(),n=+sv.dataset.n,i=Math.floor(((e.clientX-r.left)/r.width*320-28)/((320-32)/n)),id=sv.dataset.ch,c=stCh[id];
+  if(!c||i<0||i>=n||stSel[id]===i)return;
+  stSel[id]=i;sv.querySelectorAll(".hl").forEach((h,k)=>h.classList.toggle("on",k==i));$("#rd-"+id).innerHTML=c.rd(i)}
+// ---- 概要 ----
+function stOv(s){
+  const tot=s.total||1,p=s.pace,tg=s.tags||{},
+    cl=[...CLS.map((c,i)=>[c[1],s.classes[c[1]]||0,c[2],i]),[UNK[1],s.classes[UNK[1]]||0,UNK[2],-1]].filter(c=>c[1]),
+    tgh=Object.keys(TGN).map(k=>`<span class="k-${k}" data-tg="${k}"><i style="background:var(--tc)"></i>${TGN[k]} ${tg[k]||0}</span>`).join("");
+  let pace="";
+  if(p){const d=p.n-p.normal,mx=Math.max(p.n,p.normal,1)*1.15;
+    pace=`<div class="pace"><small>${p.year}年の発生ペース（${p.md}まで・全期間の集計）</small>
+     <div class="pv"><strong>${p.n}<span>個</span></strong><em>平年（1991〜2020年）は${p.normal}個 ／ <b class="${d>0?"up":d<0?"dn":""}">${d>0?"+":""}${d.toFixed(1)}</b></em></div>
+     <div class="pb"><i style="width:${p.n/mx*100}%"></i><u style="left:${p.normal/mx*100}%"></u></div>
+     <small>同じ時期までの発生数は、記録のある${p.of}年のうち多い方から${p.rank}位。平年の年間発生数は${p.full_normal}個です。</small></div>`}
+  const wh=s.wind_hist,wn=wh.reduce((a,x)=>a+x[1],0),wi=wh.reduce((m,x,i)=>x[1]>wh[m][1]?i:m,0);
+  stCh.wh={init:wi,rd:i=>{const lo=wh[i][0],a=lo==0?"14m/s以下":lo==70?"70m/s以上":`${lo}〜${lo+4}m/s`;
+    return `<b>${a}</b> ${wh[i][1]}個（${pct(wh[i][1],wn)}%）<button type="button" class="btn sm" data-dr="w:${lo}">この範囲を一覧へ</button>`}};
+  const hd=wh.map(([lo,n])=>({x:lo==0?"〜14":lo==70?"70〜":lo%10==0?String(lo):"",p:[n],c:[col(lo==0?10:lo+2)]}));
+  return `${pace}
+   <div class="kpi"><div><small>台風の数</small><strong>${s.total}<span>個</span></strong></div><div><small>年平均の発生数</small><strong>${s.avg_per_year??"-"}<span>個</span></strong></div>
+    <div><small>平均の継続日数</small><strong>${s.avg_days??"-"}<span>日</span></strong></div><div><small>平均の移動距離</small><strong>${s.avg_dist!=null?dst(s.avg_dist):"-"}<span>km</span></strong></div></div>
+   <h3 class="sh">強さ別（タップでその強さだけを一覧に表示）</h3><div class="cb">${cl.map(c=>`<i style="width:${c[1]/tot*100}%;background:${c[2]}"></i>`).join("")}</div>
+   <div class="lg">${cl.map(c=>`<span${c[3]>=0?` data-dr="c:${c[3]}"`:""}><i style="background:${c[2]}"></i>${c[0]} ${c[1]}（${pct(c[1],tot)}%）</span>`).join("")}</div>
+   <h3 class="sh">最大風速の分布（5m/sごと）</h3>${stChart("wh",hd,{c:[],h:130})}
+   <h3 class="sh">めずらしい台風（タップでその台風だけを一覧に表示）</h3><div class="lg">${tgh}</div>
+   <p class="note" style="margin-top:12px">年平均は、まだ終わっていない今年を除いて計算しています。</p>`}
+// ---- 推移 ----
+function stTr(s){
+  const ys=s.years,cy=s.cur_year;
+  if(ys.length<2)return '<p class="note" style="margin-top:12px">期間が1年だけなので推移は表示できません。「条件を変更する」で年の範囲を広げてください。</p>';
+  const ma=ys.map((r,i)=>{if(r[0]==cy)return null;const a=ys.slice(Math.max(0,i-9),i+1).filter(x=>x[0]!=cy);return a.length>=5?a.reduce((t,x)=>t+x[1],0)/a.length:null});
+  stCh.yr={init:ys.length-1,rd:i=>{const r=ys[i],aw=r[5]?(r[4]/r[5]).toFixed(1):"-";
+    return `<b>${r[0]}年${r[0]==cy?"（途中）":""}</b> ${r[1]}個 ／ 強い以上 ${r[2]}個・非常に強い以上 ${r[3]}個 ／ 最大風速の平均 ${aw}m/s<button type="button" class="btn sm" data-dr="y:${r[0]}">この年を一覧へ</button>`}};
+  const dec={};ys.filter(r=>r[0]!=cy).forEach(r=>{const k=Math.floor(r[0]/10)*10,d=dec[k]||(dec[k]=[0,0,0,0,0]);d[0]++;d[1]+=r[1];d[2]+=r[2];d[3]+=r[4];d[4]+=r[5]});
+  const tr=Object.keys(dec).map(k=>{const d=dec[k];return `<tr><td>${k}年代</td><td>${(d[1]/d[0]).toFixed(1)}</td><td>${pct(d[2],d[1])}%</td><td>${d[4]?(d[3]/d[4]).toFixed(1):"-"}</td></tr>`}).join("");
+  const data=ys.map(r=>({x:r[0]%10==0?String(r[0]):"",p:[r[2],r[1]-r[2]],c:["#ff8a3d","#38bdf8"]}));
+  return `<h3 class="sh">年別の発生数</h3>${stChart("yr",data,{c:[],line:ma})}
+   <div class="lg"><span><i style="background:#ff8a3d"></i>強い以上（33m/s〜）</span><span><i style="background:#38bdf8"></i>それ以外</span><span><span class="lk"></span>10年移動平均</span></div>
+   ${tr?`<h3 class="sh">年代別のようす</h3><table class="tb"><tr><th></th><th>年平均の発生数</th><th>強い以上の割合</th><th>最大風速の平均(m/s)</th></tr>${tr}</table>`:""}
+   <p class="note" style="margin-top:10px">今年のように終わっていない年は、移動平均と年代別から除いています。</p>`}
+// ---- 季節 ----
+function stSe(s){
+  const M=s.mon_cls,tt=M.map(a=>a.reduce((x,y)=>x+y,0)),T=tt.reduce((x,y)=>x+y,0),pk=tt.indexOf(Math.max(...tt));
+  if(!T)return '<p class="note" style="margin-top:12px">該当する台風がありません。</p>';
+  stCh.mo={init:pk,rd:i=>{const a=M[i];return `<b>${i+1}月</b> ${tt[i]}個（全体の${pct(tt[i],T)}%）／ 猛烈な ${a[0]}・非常に強い ${a[1]}・強い ${a[2]}<button type="button" class="btn sm" data-dr="m:${i+1}">この月を一覧へ</button>`}};
+  const data=M.map((a,i)=>({x:`${i+1}月`,p:[a[4],a[3],a[2],a[1],a[0]]})),hs=M.map((a,i)=>{const t=tt[i],r=t?(a[0]+a[1]+a[2])/t:0;
+    return `<div style="background:rgba(255,138,61,${(t?.1+r*.8:.05).toFixed(2)})"><small>${i+1}月</small><b>${t?Math.round(r*100):"-"}</b></div>`}).join("");
+  return `<h3 class="sh">月別の発生数</h3>${stChart("mo",data,{c:[...SC].reverse()})}
+   <div class="lg">${CLS.map(c=>`<span><i style="background:${c[2]}"></i>${c[1]}</span>`).join("")}</div>
+   <p style="font-size:13px;margin:10px 0 0">最も多いのは<b>${pk+1}月</b>（${tt[pk]}個）。7〜10月で全体の<b>${pct(tt[6]+tt[7]+tt[8]+tt[9],T)}%</b>です。</p>
+   <h3 class="sh">月別の「強い以上」の割合（%）</h3><div class="hs">${hs}</div>
+   <p class="note" style="margin-top:6px">その月に発生した台風のうち、最大風速33m/s以上になったものの割合。色が濃いほど強まりやすい時期です。</p>`}
+// ---- 記録 ----
+function stRc(s){
+  const L=(s.rec||{})[stRec]||[],u={wind:r=>`${r.v}m/s${r.p?` ・ ${r.p}hPa`:""}`,pres:r=>`${r.v}hPa${r.w!=null?` ・ ${r.w}m/s`:""}`,days:r=>`${r.v}日`,dist:r=>`${dst(r.v)}km`,size:r=>`${dst(r.v)}km`}[stRec];
+  return `<div class="chips" style="margin-top:10px">${RECS.map(([k,n])=>`<button type="button" class="chip${k==stRec?" on":""}" data-rec="${k}">${n}</button>`).join("")}</div>
+   ${L.length?`<ul class="rk" style="margin-top:8px">${L.map((r,i)=>`<li data-sid="${esc(r.sid)}"><span>${i+1}. ${esc(r.title)}</span><b>${u(r)}</b></li>`).join("")}</ul>`:'<p class="note" style="margin-top:8px">該当する台風がありません。</p>'}
+   <p class="note" style="margin-top:8px">${RECN[stRec]}（上位10）。タップで地図に表示します。</p>`}
+function stRender(){
+  if(!stD)return;stCh={};stSel={};
+  document.querySelectorAll("#stSeg button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.sub==stSub)));
+  $("#stPane").innerHTML=({ov:stOv,tr:stTr,se:stSe,rc:stRc}[stSub]||stOv)(stD);
+  for(const id in stCh){const sv=$(`svg.ch[data-ch="${id}"]`),i=stCh[id].init||0,h=sv&&sv.querySelectorAll(".hl")[i];
+    if(h){h.classList.add("on");stSel[id]=i;$("#rd-"+id).innerHTML=stCh[id].rd(i)}}}
 async function loadStats(){
   const my=++stSeq,b=$("#stBody");b.innerHTML='<p class="note">集計中…</p>';
   const q=new URLSearchParams(lastP);["limit","sort","order"].forEach(k=>q.delete(k));
-  try{const s=await (await fetch("/api/stats?"+q)).json();if(my!=stSeq)return;
-    const tot=s.total||1,ys=s.years,cl=[...CLS,UNK].map(c=>[c[1],s.classes[c[1]]||0,c[2]]).filter(c=>c[1]);
-    const tg=s.tags||{},tgh=Object.keys(TGN).map(k=>`<span class="k-${k}" data-tg="${k}"><i style="background:var(--tc)"></i>${TGN[k]} ${tg[k]||0}</span>`).join(""),
-      rs=(s.top_size||[]).map((r,i)=>`<li data-sid="${esc(r.sid)}"><span>${i+1}. ${esc(r.title)}</span><b>${dst(r.r30)}km</b></li>`).join(""),
-      rk=(s.top_dist||[]).map((r,i)=>`<li data-sid="${esc(r.sid)}"><span>${i+1}. ${esc(r.title)}</span><b>${dst(r.dist)}km</b></li>`).join("");
-    const bars=(a,c)=>{const mx=Math.max(1,...a.map(x=>x[1])),w=100/a.length;
-      return `<svg class="bs" viewBox="0 0 100 40" preserveAspectRatio="none">${a.map((x,i)=>`<rect x="${(i*w+.15).toFixed(2)}" y="${(38-x[1]/mx*36).toFixed(2)}" width="${(w-.3).toFixed(2)}" height="${(x[1]/mx*36).toFixed(2)}" fill="${c}"><title>${x[0]}: ${x[1]}</title></rect>`).join("")}</svg>`};
+  try{const r=await fetch("/api/stats?"+q);if(!r.ok)throw 0;const s=await r.json();if(my!=stSeq)return;stD=s;
     b.innerHTML=`<div class="cond"><div class="note">集計の対象（「過去の台風」で絞り込んだ条件）</div><b>${esc(condText(lastP))}</b><button type="button" class="btn sm" data-a="gotodb">条件を変更する</button></div>
-     <div class="kpi"><div><small>台風の数</small><strong>${s.total}<span>個</span></strong></div><div><small>平均の継続日数</small><strong>${s.avg_days??"-"}<span>日</span></strong></div>
-      <div><small>平均の移動距離</small><strong>${s.avg_dist!=null?dst(s.avg_dist):"-"}<span>km</span></strong></div><div><small>最長の移動距離</small><strong>${s.max_dist!=null?dst(s.max_dist):"-"}<span>km</span></strong></div>
-      <div class="w2"><small>最も長く続いた台風</small><strong style="font-size:14px">${s.max_row?esc(s.max_row.title)+"（"+s.max_row.days+"日）":"-"}</strong></div></div>
-     <h3 class="sh">強さ別</h3><div class="cb">${cl.map(c=>`<i style="width:${c[1]/tot*100}%;background:${c[2]}"></i>`).join("")}</div>
-     <div class="lg">${cl.map(c=>`<span><i style="background:${c[2]}"></i>${c[0]} ${c[1]}</span>`).join("")}</div>
-     <h3 class="sh">めずらしい台風（タップでその台風だけを一覧に表示）</h3><div class="lg">${tgh}</div>
-     ${rk?`<h3 class="sh">移動距離が長い台風 Top5</h3><ul class="rk">${rk}</ul>`:""}
-     ${rs?`<h3 class="sh">強風域が大きかった台風 Top5（最大半径）</h3><ul class="rk">${rs}</ul>`:""}
-     <h3 class="sh">月別の発生数</h3>${bars(s.months.map((n,i)=>[(i+1)+"月",n]),"#38bdf8")}<div class="ax"><span>1月</span><span>6月</span><span>12月</span></div>
-     ${ys.length>1?`<h3 class="sh">年別の発生数</h3>${bars(ys,"#ff8a3d")}<div class="ax"><span>${ys[0][0]}</span><span>${ys[ys.length-1][0]}</span></div>`:""}`;
-  }catch(e){if(my==stSeq)b.innerHTML='<p class="note">集計に失敗しました。時間をおいて再度お試しください</p>'}}
+     <div class="segw"><div class="seg" id="stSeg" role="tablist">${STS.map(([k,n])=>`<button type="button" role="tab" data-sub="${k}">${n}</button>`).join("")}</div></div><div id="stPane"></div>`;
+    stRender()}
+  catch(e){if(my==stSeq)b.innerHTML='<p class="note">集計に失敗しました。時間をおいて再度お試しください</p>'}}
+$("#stBody").addEventListener("pointerdown",stPick);
+$("#stBody").addEventListener("pointermove",e=>{if(e.pointerType=="mouse"||e.buttons)stPick(e)});
 $("#stBody").addEventListener("click",e=>{
   if(e.target.closest("[data-a=gotodb]"))return setTab("db");
+  const sb=e.target.closest("[data-sub]");if(sb){stSub=sb.dataset.sub;stRender();return}
+  const rc=e.target.closest("[data-rec]");if(rc){stRec=rc.dataset.rec;stRender();return}
+  const dr=e.target.closest("[data-dr]");
+  if(dr){const[k,v]=dr.dataset.dr.split(":"),n=+v;
+    drill(k=="y"?{year_from:n,year_to:n}:k=="m"?{month:n}:k=="c"?CW[n]:{wind_min:n?n:"",wind_max:n==70?"":n==0?14:n+4});return}
   const g=e.target.closest("[data-tg]");if(g){tags.clear();tags.add(g.dataset.tg);tgSync();setTab("db");load();if(mobile())openPanel();return}
   const r=e.target.closest(".rk li");if(r){setTab("db");show(r.dataset.sid)}});
 
