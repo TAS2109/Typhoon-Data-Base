@@ -6,7 +6,9 @@
 風速はm/s表示（DB内部はkt保持、API出力時に換算）。
 今年ぶんは 位置表PDF（確定・速報）＋防災情報JSON（発生中の台風）＋デジタル台風（NII、PDF未掲載の消滅済み台風の補完）で随時更新する。
 データ出典: 気象庁 / IBTrACS / デジタル台風（国立情報学研究所・北本朗）
-画面: 1ページ・地図共有の3タブ構成（予報 / 過去の台風 / 統計）。旧 /forecast は /#fc へ転送。
+画面: 1ページ・地図共有の4タブ構成（予報 / 過去の台風 / 統計 / 実況）。旧 /forecast は /#fc へ転送。
+実況タブ: 発生中の台風の実況・進路予報（気象庁 防災情報JSON）＋アメダスの観測値（風速・瞬間風速・気圧・雨量）＋警報・注意報。
+  取得元の確認:  /api/live/diag をブラウザで開く（JSONの形が変わった時の診断用）
 統計タブ: 概要（今年の発生ペース・強さ別・風速分布）/ 推移（年別・年代別）/ 季節（月別）/ 記録（Top10）の4サブタブ。
   グラフをなぞると内訳が出て、年・月・強さ・風速帯をタップすると「過去の台風」へ絞り込んで移る。集計対象は「過去の台風」の絞り込み条件と共通。
 強風域・暴風域（気象庁の半径）は radii テーブルに保存し、過去の台風タブで表示する（既定ON）。
@@ -1580,6 +1582,258 @@ def fc_detail(sid: str, jma: str = ""):
 def forecast_page():
     return RedirectResponse("/#fc")
 
+# ---------------- 実況タブ（防災情報JSON・アメダス・警報注意報）----------------
+# 台風が発生していなくても、観測値と警報・注意報は取得できる。3系統は別々のAPIにして、1つの失敗で他を止めない。
+AMEDAS = "https://www.jma.go.jp/bosai/amedas"
+WARN_URL = "https://www.jma.go.jp/bosai/warning/data/warning/map.json"
+AREA_URL = "https://www.jma.go.jp/bosai/common/const/area.json"
+W_SPECIAL = {"32", "33", "35", "36", "37", "38"}              # 特別警報
+W_ALERT = {"02", "03", "04", "05", "06", "07", "08"}          # 警報（それ以外の既知コードは注意報）
+W_NAME = {"32": "暴風雪", "33": "大雨", "35": "暴風", "36": "大雪", "37": "波浪", "38": "高潮",
+          "02": "暴風雪", "03": "大雨", "04": "洪水", "05": "暴風", "06": "大雪", "07": "波浪", "08": "高潮",
+          "10": "大雨", "12": "大雪", "13": "風雪", "14": "雷", "15": "強風", "16": "波浪", "17": "融雪",
+          "18": "洪水", "19": "高潮", "20": "濃霧", "21": "乾燥", "22": "なだれ", "23": "低温", "24": "霜",
+          "25": "着氷", "26": "着雪"}
+
+def _jget(url):
+    """取得に失敗したら例外にする（get_json は握りつぶすため、キャッシュの判定には使わない）。"""
+    r = requests.get(url, headers=UA, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def _jp(v):
+    """{"jp": "..."} でも文字列でも日本語表記を返す。数値や空は None。"""
+    if isinstance(v, dict):
+        v = v.get("jp") or v.get("en")
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+def _km(v):
+    """半径らしき値 → km。{"km":..} / {"nm":..} / {"radius":{..}} / 数値 / リスト（先頭の有効値）のどれでも読む。"""
+    if isinstance(v, dict):
+        if "km" in v:
+            return num(v["km"])
+        if "nm" in v:
+            n = num(v["nm"])
+            return n * NM if n else None
+        for k in ("radius", "range", "circle", "areas"):
+            if k in v:
+                x = _km(v[k])
+                if x:
+                    return x
+        return None
+    if isinstance(v, list):
+        return next((x for x in map(_km, v) if x), None)
+    return num(v)
+
+def _iso_utc(v):
+    s = str(v.get("UTC", "")) if isinstance(v, dict) else ""
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S").strftime("%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+def _wind(r, k):
+    return num(((r.get("maximumWind") or {}).get(k) or {}).get("m/s"))
+
+def _speed(r):
+    sp = r.get("speed")
+    return num(sp.get("km/h")) if isinstance(sp, dict) else num(sp)
+
+def _r6(r):
+    """実況の暴風域・強風域 → [向き, 長径km, 短径km, 向き, 長径km, 短径km]（画面の wzShape と同じ形）。無ければ None。"""
+    storm = gale = None
+    for k, v in r.items():
+        kl = str(k).lower()
+        if "storm" in kl and "circle" not in kl:
+            storm = _warn_area(v)
+        elif "gale" in kl:
+            gale = _warn_area(v)
+    if not storm and not gale:
+        return None
+    return [round(x, 1) if isinstance(x, float) else x for a in (storm, gale) for x in (a or (None, None, None))]
+
+def live_storm(tc, tn):
+    """発生中の台風1つぶんの実況・進路予報（気象庁）。実況の詳細は specifications.json、予報円は forecast.json。"""
+    spec = get_json(f"{BOSAI}/{tc}/specifications.json", []) or []
+    fc = get_json(f"{BOSAI}/{tc}/forecast.json", []) or []
+    out = {"tc": tc, "no": int(tn[2:]), "year": 2000 + int(tn[:2]), "en": _title_en(spec) or _title_en(fc),
+           "now": None, "fc": [], "past": []}
+    for r in spec:
+        p = r.get("part") if isinstance(r, dict) else None
+        if isinstance(p, dict) and p.get("jp") == "実況":
+            try:
+                la, lo = (float(x) for x in r["position"]["deg"][:2])
+            except (KeyError, TypeError, ValueError, IndexError):
+                break
+            lb = {k: _jp(v) for k, v in r.items()
+                  if isinstance(v, dict) and k not in ("part", "position", "validtime", "course") and _jp(v)}
+            out["now"] = {"t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
+                          "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"), "course": _jp(r.get("course")),
+                          "speed": _speed(r), "r": _r6(r), "lb": lb}
+            break
+    for r in fc:
+        if not isinstance(r, dict) or r.get("advancedHours") is None:
+            continue
+        try:
+            h = int(r["advancedHours"])
+            la, lo = float(r["center"][0]), float(r["center"][1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        if h == 0:
+            out["past"] = [[round(a, 2), round(b, 2)] for a, b in past_track(r.get("track"))]
+            if out["now"] is None:  # specifications.json に実況が無い時は、forecast.json の実況点で代用
+                out["now"] = {"t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
+                              "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"), "course": None, "speed": None,
+                              "r": None, "lb": {}}
+            continue
+        circ = next((v for k, v in r.items() if "circle" in str(k).lower()), None)  # 予報円
+        out["fc"].append({"h": h, "t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
+                          "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"),
+                          "circle": _km(circ), "storm": _km(r.get("stormWarning"))})  # 暴風警戒域
+    out["fc"].sort(key=lambda p: p["h"])
+    return out
+
+@app.get("/api/live/storms")
+def live_storms():
+    def go():
+        lst = get_json(f"{BOSAI}/targetTc.json", None)
+        if lst is None:
+            raise requests.RequestException("targetTc.json を取得できません")
+        storms = []
+        for t in lst:
+            tn, tc = str(t.get("typhoonNumber", "")), t.get("tropicalCyclone")
+            if not tc or not re.fullmatch(r"\d{4}", tn):  # 熱帯低気圧(号数なし)は対象外
+                continue
+            try:
+                s = live_storm(tc, tn)
+            except Exception as e:
+                print(f"live storm {tc} failed:", repr(e), flush=True)
+                continue
+            if s["now"]:
+                storms.append(s)
+        return {"storms": sorted(storms, key=lambda s: (s["year"], s["no"]))}
+    try:
+        return _cached("lv:storms", 180, go)
+    except requests.RequestException as e:
+        raise HTTPException(502, f"台風の実況を取得できません: {e}")
+
+def _q(d, k):
+    """アメダスの値は [値, 品質] の組。品質が正常(0)の時だけ値を返す。"""
+    v = d.get(k)
+    if isinstance(v, list) and v and v[0] is not None and (len(v) < 2 or v[1] in (0, None)):
+        return v[0]
+    return None
+
+def _lv1(v):
+    return None if v is None else round(float(v), 1)
+
+def live_amedas():
+    tbl = _cached("lv:amtbl", 86400, lambda: _jget(f"{AMEDAS}/const/amedastable.json"))
+    r = requests.get(f"{AMEDAS}/data/latest_time.txt", headers=UA, timeout=30)
+    r.raise_for_status()
+    ts = datetime.fromisoformat(r.text.strip())
+    data = _jget(f"{AMEDAS}/data/map/{ts.strftime('%Y%m%d%H%M%S')}.json")
+    rows = []
+    # 列: id, 地点名, 緯度, 経度, 風速m/s, 風向(0=静穏,1=北北東…16=北), 最大瞬間風速m/s, 海面気圧hPa, 1時間雨量, 3時間雨量, 24時間雨量(mm)
+    for sid, d in data.items():
+        s = tbl.get(sid)
+        if not s or not isinstance(d, dict):
+            continue
+        row = [_q(d, "wind"), _q(d, "windDirection"), _q(d, "gust"), _q(d, "normalPressure"),
+               _q(d, "precipitation1h"), _q(d, "precipitation3h"), _q(d, "precipitation24h")]
+        if all(x is None for x in row):
+            continue
+        w, wd, g, p, r1, r3, r24 = row
+        rows.append([sid, s.get("kjName") or sid, round(s["lat"][0] + s["lat"][1] / 60, 3), round(s["lon"][0] + s["lon"][1] / 60, 3),
+                     _lv1(w), wd, _lv1(g), _lv1(p), _lv1(r1), _lv1(r3), _lv1(r24)])
+    return {"t": ts.isoformat(), "rows": rows}
+
+@app.get("/api/live/amedas")
+def api_amedas():
+    try:
+        return _cached("lv:amedas", 240, live_amedas)
+    except (requests.RequestException, ValueError, KeyError) as e:
+        raise HTTPException(502, f"アメダスの観測値を取得できません: {e!r}")
+
+def _to_office(area, code, depth=0):
+    """地域コード（市町村等・一次細分区域など）→ 府県予報区（offices）のコード。"""
+    if code in area.get("offices", {}):
+        return code
+    if depth > 4:
+        return None
+    for lv in ("class20s", "class15s", "class10s"):
+        a = area.get(lv, {}).get(code)
+        if a and a.get("parent"):
+            return _to_office(area, a["parent"], depth + 1)
+    return None
+
+def live_warnings():
+    area = _cached("lv:area", 86400, lambda: _jget(AREA_URL))
+    raw = _jget(WARN_URL)
+    cities, reported = {}, ""   # 地域コード → {警報コード: 状態}
+    for it in raw if isinstance(raw, list) else [raw]:
+        if not isinstance(it, dict):
+            continue
+        reported = max(reported, str(it.get("reportDatetime") or ""))
+        for at in it.get("areaTypes") or []:
+            for a in at.get("areas") or []:
+                for w in a.get("warnings") or []:
+                    if w.get("code") and w.get("status") not in ("解除", "発表警報・注意報はなし"):
+                        cities.setdefault(str(a.get("code")), {})[str(w["code"])] = w.get("status")
+    offices = {}
+    for code, ws in cities.items():
+        oc = _to_office(area, code)
+        if not oc:
+            continue
+        o = offices.setdefault(oc, {"code": oc, "name": area["offices"][oc].get("name", oc), "n": 0, "w": {}})
+        is20 = code in area.get("class20s", {})
+        o["n"] += 1 if is20 else 0
+        for c in ws:
+            o["w"][c] = o["w"].get(c, 0) + (1 if is20 else 0)
+    out = []
+    for o in offices.values():
+        ws = [{"c": c, "name": W_NAME.get(c, c), "lv": 3 if c in W_SPECIAL else 2 if c in W_ALERT else 1, "k": max(k, 1)}
+              for c, k in o["w"].items()]
+        ws.sort(key=lambda x: (-x["lv"], -x["k"]))
+        out.append({"code": o["code"], "name": o["name"], "n": o["n"], "w": ws})
+    return {"t": reported, "offices": sorted(out, key=lambda o: o["code"])}
+
+@app.get("/api/live/warnings")
+def api_warnings():
+    try:
+        return _cached("lv:warn", 240, live_warnings)
+    except (requests.RequestException, ValueError, KeyError) as e:
+        raise HTTPException(502, f"警報・注意報を取得できません: {e!r}")
+
+@app.get("/api/live/diag")
+def live_diag():
+    """実況タブの取得元を確認する用（JSONの形が変わった時にブラウザで見る）。台風1つぶんの生データと、アメダス・警報の先頭を返す。"""
+    from fastapi.responses import PlainTextResponse
+    out = {}
+    try:
+        lst = _jget(f"{BOSAI}/targetTc.json")
+        out["targetTc"] = lst
+        t = next((x for x in lst if re.fullmatch(r"\d{4}", str(x.get("typhoonNumber", "")))), None)
+        if t:
+            tc = t["tropicalCyclone"]
+            out["specifications"] = _jget(f"{BOSAI}/{tc}/specifications.json")
+            out["forecast(先頭3件)"] = (_jget(f"{BOSAI}/{tc}/forecast.json") or [])[:3]
+    except Exception as e:
+        out["storm_error"] = repr(e)
+    try:
+        a = live_amedas()
+        out["amedas"] = {"time": a["t"], "stations": len(a["rows"]), "sample": a["rows"][:3],
+                         "gustあり": sum(1 for r in a["rows"] if r[6] is not None),
+                         "気圧あり": sum(1 for r in a["rows"] if r[7] is not None)}
+    except Exception as e:
+        out["amedas_error"] = repr(e)
+    try:
+        w = live_warnings()
+        out["warnings"] = {"time": w["t"], "offices": len(w["offices"]), "sample": w["offices"][:3]}
+    except Exception as e:
+        out["warnings_error"] = repr(e)
+    return PlainTextResponse(json.dumps(out, ensure_ascii=False, indent=1)[:60000])
+
 # ---------------- 画面 ----------------
 PAGE = r"""<!doctype html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -1599,7 +1853,7 @@ input,select,button{font:inherit;color:var(--ink);touch-action:manipulation}
 :focus-visible{outline:2px solid var(--acc);outline-offset:1px}
 
 /* ---- 画面切り替えタブ（PC: 左パネル上部 / スマホ: 画面下部） ---- */
-#tabs{position:fixed;left:0;top:0;width:400px;height:56px;z-index:1700;display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:7px 10px;background:var(--s1);border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
+#tabs{position:fixed;left:0;top:0;width:400px;height:56px;z-index:1700;display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding:7px 10px;background:var(--s1);border-bottom:1px solid var(--line);border-right:1px solid var(--line)}
 #tabs button{border:0;border-radius:10px;background:transparent;color:var(--sub);display:flex;flex-direction:column;align-items:center;justify-content:center;line-height:1.25;cursor:pointer}
 #tabs b{font-size:14px}#tabs small{font-size:10px;opacity:.85}
 #tabs button:hover{background:var(--s2)}
@@ -1608,7 +1862,7 @@ input,select,button{font:inherit;color:var(--ink);touch-action:manipulation}
 /* ---- 左パネル（3つの画面が同じ場所に入る） ---- */
 aside{display:flex;flex-direction:column;min-height:0;background:var(--s1);border-right:1px solid var(--line);padding-top:56px}
 .sec{display:none;flex-direction:column;min-height:0;flex:1}
-body[data-tab=fc] #s-fc,body[data-tab=db] #s-db,body[data-tab=st] #s-st{display:flex}
+body[data-tab=fc] #s-fc,body[data-tab=db] #s-db,body[data-tab=st] #s-st,body[data-tab=lv] #s-lv{display:flex}
 .shd,.grab{display:none}
 .pad{padding:12px 14px 6px;display:grid;gap:8px;flex:none}
 .scroll{flex:1;min-height:0;overflow:auto;overscroll-behavior:contain;padding:2px 14px 18px;-webkit-overflow-scrolling:touch}
@@ -1726,7 +1980,7 @@ footer{padding:8px 16px;border-top:1px solid var(--line);color:var(--sub);font-s
 main{position:relative;min-height:0}#map{height:100%;background:#0b1522;z-index:0}
 .card{position:absolute;z-index:500;background:rgba(16,26,48,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border:1px solid var(--line);border-radius:var(--r)}
 #info{right:14px;top:14px;padding:12px 14px;width:320px;max-width:calc(100% - 28px)}
-body[data-tab=fc] #info,body[data-tab=st] #info{display:none}
+body[data-tab=fc] #info,body[data-tab=st] #info,body[data-tab=lv] #info{display:none}
 .hd{display:flex;align-items:flex-start;gap:8px}.hd h2{flex:1;margin:0;font-size:17px;min-width:0}
 #info .sub{color:var(--sub);font-size:12px}
 .g{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
@@ -1756,6 +2010,23 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 .leaflet-tooltip{background:var(--s1);color:var(--ink);border:1px solid var(--line);border-radius:8px}
 .leaflet-control-attribution{font-size:9px}
 
+/* ---- 実況 ---- */
+.mets{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.mt{display:block;width:100%;text-align:left;border:1px solid transparent;border-radius:10px;background:var(--s2);padding:7px 10px;cursor:pointer;color:var(--ink)}
+.mt.on{border-color:var(--acc)}
+.mt small{display:block;color:var(--sub);font-size:11px}
+.mt strong{font:700 18px "Space Grotesk",system-ui,sans-serif}.mt strong span{font-size:11px;font-weight:400;color:var(--sub);margin-left:2px}
+.mt em{display:block;font-style:normal;color:var(--sub);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tb small{color:var(--sub);font-size:10px}
+.wsum{display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 8px}
+.wr{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:var(--s2);border-radius:10px;padding:7px 10px;border-left:4px solid var(--wc);margin-top:6px}
+.wr b{font-size:13px;flex:none;min-width:5.5em}
+.wr small{margin-left:auto;color:var(--sub);font-size:11px}
+.wr.l1{--wc:#fbbf24}.wr.l2{--wc:#ef4444}.wr.l3{--wc:#7c3aed}
+.wb{font-style:normal;font-size:11px;font-weight:700;padding:1px 8px;border-radius:99px;white-space:nowrap}
+.wb.l1{background:#fbbf24;color:#1a1200}.wb.l2{background:#ef4444;color:#fff}.wb.l3{background:#7c3aed;color:#fff}
+.lvk{color:var(--sub);font-size:11px;display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 6px}.lvk .wb{font-size:10px;padding:0 7px}
+
 /* ---- スマホ ---- */
 @media(max-width:760px){
  :root{--tb:calc(58px + env(safe-area-inset-bottom))}
@@ -1766,11 +2037,11 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
  body.lst #bd{opacity:1;pointer-events:auto}
  aside{position:fixed;left:0;right:0;bottom:var(--tb);height:calc(86dvh - var(--tb));z-index:1500;padding-top:0;border:0;border-top:1px solid var(--line);border-radius:20px 20px 0 0;box-shadow:0 -12px 40px #000a;transform:translateY(115%);transition:transform .3s cubic-bezier(.2,.8,.2,1);overscroll-behavior:contain}
  body.lst aside{transform:none}
- body[data-tab=fc] aside{height:auto;max-height:46dvh;transform:none;z-index:900;box-shadow:0 -8px 30px #0008}
+ body[data-tab=fc] aside,body[data-tab=lv] aside{height:auto;max-height:46dvh;transform:none;z-index:900;box-shadow:0 -8px 30px #0008}
  .grab{display:block;height:20px;position:relative;flex:none}.grab::before{content:"";position:absolute;left:50%;top:9px;width:44px;height:5px;margin-left:-22px;border-radius:3px;background:var(--line)}
  .shd{display:flex;justify-content:space-between;align-items:center;padding:0 14px 8px;flex:none}.shd b{font-size:16px}
- body[data-tab=fc] .grab,body[data-tab=fc] .shd{display:none}
- #s-fc .pad{padding-top:14px}
+ body[data-tab=fc] .grab,body[data-tab=fc] .shd,body[data-tab=lv] .grab,body[data-tab=lv] .shd{display:none}
+ #s-fc .pad,#s-lv .pad{padding-top:14px}
  header{max-height:52%;overflow:auto;padding:0 12px 8px;gap:10px;overscroll-behavior:contain}
  .f input:not([type=checkbox]),.f select{font-size:16px;padding:12px 14px;min-height:46px}  /* iOSの自動ズーム防止 */
  .chips{flex-wrap:nowrap;overflow-x:auto;margin:0 -12px;padding:0 12px;scrollbar-width:none}.chips::-webkit-scrollbar{display:none}
@@ -1797,6 +2068,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
  <button type="button" role="tab" data-t="fc" aria-selected="false"><b>予報</b><small>現在の台風</small></button>
  <button type="button" role="tab" data-t="db" aria-selected="true"><b>過去の台風</b><small>検索・進路</small></button>
  <button type="button" role="tab" data-t="st" aria-selected="false"><b>統計</b><small>集計</small></button>
+ <button type="button" role="tab" data-t="lv" aria-selected="false"><b>実況</b><small>観測・警報</small></button>
 </nav>
 <aside>
  <div class="grab" id="grab"></div>
@@ -1867,6 +2139,30 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 
  <!-- 画面3: 統計 -->
  <section id="s-st" class="sec"><div class="scroll" id="stBody"></div></section>
+
+  <!-- 画面4: 実況 -->
+  <section id="s-lv" class="sec">
+   <div class="pad">
+    <div class="sel"><select id="lsel" aria-label="実況を見る台風"></select><button type="button" class="btn" id="lrf">更新</button></div>
+    <div id="lnote" class="note"></div>
+   </div>
+   <div class="scroll">
+    <h3 class="sh">台風の実況（気象庁）</h3><div id="lvNow"></div>
+    <h3 class="sh">進路予報（気象庁）</h3><div id="lvFc"></div>
+    <h3 class="sh">地図の表示</h3>
+    <div class="btns"><button type="button" class="btn on" id="lvTrk">進路・予報円</button><button type="button" class="btn on" id="lvRad">暴風域・強風域</button><button type="button" class="btn on" id="lvObs">観測値</button></div>
+    <div class="note" style="margin-top:6px">白の破線＝これまでの進路、白の実線と円＝予報（円の中に台風の中心が入る確率は70%）、赤い帯＝暴風警戒域。実況の赤い破線＝暴風域、黄色の破線＝強風域。</div>
+    <h3 class="sh">観測（アメダス）— 全国の最大値。タップで地図に表示</h3>
+    <div class="mets" id="lvMet"></div>
+    <h3 class="sh" id="lvTopT">上位10地点</h3><ul class="rk" id="lvTop"></ul>
+    <h3 class="sh">警報・注意報</h3>
+    <div id="lvWsum" class="wsum"></div>
+    <div class="lvk"><span><i class="wb l3">特別警報</i></span><span><i class="wb l2">警報</i></span><span><i class="wb l1">注意報</i></span></div>
+    <label class="chk" style="margin-top:0"><input type="checkbox" id="lvAll">台風に関係しない種類（雷・濃霧・乾燥など）も表示</label>
+    <div id="lvWarn"></div>
+    <div id="lvSrc" class="note" style="margin-top:16px">出典: 気象庁（防災情報・アメダス・警報注意報）。台風の風速は10分間平均、時刻は日本時間。観測値は速報で、欠測や品質の低い値は除いています。5分ごとに自動で更新します。</div>
+   </div>
+  </section>
 </aside>
 <main><div id="map"></div><button id="fit" type="button">全体を表示</button><div id="info" class="card" hidden></div><button id="fab" type="button">台風を探す</button><div id="legend" class="card"></div></main>
 <dialog id="dlg"></dialog>
@@ -1875,7 +2171,7 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
 <script src="https://unpkg.com/polygon-clipping@0.15.7/dist/polygon-clipping.umd.min.js"></script>
 <script>
 // ================= 共通 =================
-const TABS={fc:"予報",db:"過去の台風",st:"統計"};
+const TABS={fc:"予報",db:"過去の台風",st:"統計",lv:"実況"};
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 const mobile=()=>matchMedia("(max-width:760px)").matches;
@@ -1906,23 +2202,27 @@ const dbLayerList=[];   // 過去の台風の地図レイヤー（予報タブ�
 function dbLayers(on){dbLayerList.forEach(l=>on?l.addTo(map):l.remove())}
 function legend(){
   const el=$("#legend");
+  if(tab=="lv"){el.innerHTML=LV.legend();return}
   el.innerHTML=tab=="fc"
     ?`<div class="lgh">強さ（印の中）</div>`+FCLS.map(c=>`<div><i class="dot" style="--s:${c[3]}px;background:${c[2]}"></i>${c[1]}</div>`).join("")+`<div class="lgh">細い外枠・輪 = モデル</div>`
     :[...CLS,UNK].map(c=>`<div><i style="background:${c[2]}"></i>${c[1]}</div>`).join("");
 }
 function setTab(t){
   if(!TABS[t])t="db";
-  const pg=tab?(tab=="fc"?"fc":"db"):"",g=t=="fc"?"fc":"db";
+  const GRP=x=>x=="fc"?"fc":x=="lv"?"lv":"db",pg=tab?GRP(tab):"",g=GRP(t);
   tab=t;document.body.dataset.tab=t;tabMem.set(t);
   document.querySelectorAll("#tabs button").forEach(b=>b.setAttribute("aria-selected",String(b.dataset.t==t)));
   $("#shT").textContent=t=="st"?"統計":"台風を探す";
   if(g!=pg){
     if(pg)views[pg]={c:map.getCenter(),z:map.getZoom()};
-    if(g=="fc"){dbLayers(false);FC.show()}else{FC.hide();dbLayers(true)}
+    if(g=="fc")FC.show();else FC.hide();
+    if(g=="lv")LV.show();else LV.hide();
+    dbLayers(g=="db");
     map.invalidateSize();
     const v=views[g];
     if(v)map.setView(v.c,v.z,{animate:false});
     else if(g=="fc")FC.fit();
+    else if(g=="lv")LV.fit();
     else if(cur)map.fitBounds(cur.bounds,fitOpt());
   }
   if(mobile()){if(t=="st")openPanel();else closePanel()}
@@ -1931,9 +2231,9 @@ function setTab(t){
   history.replaceState(null,"",t=="db"?(curSid?"#"+curSid:location.pathname+location.search):"#"+t);
 }
 $("#tabs").onclick=e=>{const b=e.target.closest("button");if(!b)return;const t=b.dataset.t;
-  if(t==tab&&mobile()&&t!="fc"){openPanel();return}
+  if(t==tab&&mobile()&&t!="fc"&&t!="lv"){openPanel();return}
   setTab(t)};
-$("#fit").onclick=()=>{if(tab=="fc")FC.fit();else if(cur)map.fitBounds(cur.bounds,fitOpt())};
+$("#fit").onclick=()=>{if(tab=="fc")FC.fit();else if(tab=="lv")LV.fit();else if(cur)map.fitBounds(cur.bounds,fitOpt())};
 
 // ================= 過去の台風 =================
 const K=w=>w==null?UNK:CLS.find(c=>w>=c[0]),col=w=>K(w)[2],cls=w=>K(w)[1];
@@ -2495,6 +2795,154 @@ async function init(){setNote("台風の一覧を取得中…");
   catch(e){setNote("台風の一覧を取得できませんでした。「更新」で再試行してください")}}
 $("#fsel").onchange=load;$("#frf").onclick=init;
 return{show,hide,fit};
+})();
+
+// ================= 実況 =================
+// 台風の実況・進路予報（気象庁 防災情報）／アメダスの観測値／警報・注意報。台風が発生していなくても、観測と警報は見られる
+const LV=(()=>{
+const COLS=["#3d4f66","#4fc3f7","#a3e635","#ffd24a","#ff8a3d","#ff4d7d","#d946ef","#a855f7"];
+const D16=["静穏","北北東","北東","東北東","東","東南東","南東","南南東","南","南南西","南西","西南西","西","西北西","北西","北北西","北"];
+const DN=[null,"北東","東","南東","南","南西","西","北西","北"];
+const RN=(lim)=>lim.map((v,i)=>i?`${v}〜`:`〜${lim[1]}`);
+// i=観測データの列番号。lo=小さいほど強い（気圧）。all=0やゼロ付近も描く
+const MET={
+ wind:{n:"風速",s:"最大風速",u:"m/s",i:4,all:1,lim:[0,5,10,15,20,25,30,40]},
+ gust:{n:"最大瞬間風速",s:"最大瞬間風速",u:"m/s",i:6,all:1,lim:[0,10,15,20,25,30,40,50]},
+ pres:{n:"気圧（海面）",s:"最低気圧",u:"hPa",i:7,all:1,lo:1,lim:[-9999,-1010,-1000,-990,-980,-970,-960,-950],lb:["1010超","〜1010","〜1000","〜990","〜980","〜970","〜960","〜950"]},
+ r1:{n:"1時間雨量",s:"1時間雨量",u:"mm",i:8,lim:[0,1,5,10,20,30,50,80]},
+ r3:{n:"3時間雨量",s:"3時間雨量",u:"mm",i:9,lim:[0,10,30,50,100,150,200,300]},
+ r24:{n:"24時間雨量",s:"24時間雨量",u:"mm",i:10,lim:[0,10,50,100,200,300,400,500]}};
+const REL=new Set(["03","04","05","07","08","10","15","16","18","19","33","35","37","38"]);   // 台風に関係する種類（暴風・大雨・洪水・波浪・高潮・強風）
+const trkL=L.layerGroup(),radL=L.layerGroup(),obsL=L.layerGroup();
+map.createPane("lvobs").style.zIndex=420;map.createPane("lvtk").style.zIndex=430;
+const cv=L.canvas({pane:"lvobs",padding:.3});
+let active=false,ready=false,S=[],sel=0,obs=null,wrn=null,met="wind",timer=null,seq=0,fitted=false,loadedAt=0,mk={};
+const vis={trk:true,rad:true,obs:true};
+const fv=v=>v==null?"-":Number.isInteger(v)?String(v):v.toFixed(1);
+const T=iso=>{if(!iso)return"-";const d=new Date(new Date(iso).getTime()+9*3600e3),z=n=>String(n).padStart(2,"0");return `${d.getUTCMonth()+1}/${d.getUTCDate()} ${z(d.getUTCHours())}:${z(d.getUTCMinutes())}`};
+const DH=iso=>{if(!iso)return"-";const d=new Date(new Date(iso).getTime()+9*3600e3);return `${d.getUTCMonth()+1}/${d.getUTCDate()} ${d.getUTCHours()}時`};
+const nm=en=>en?en.charAt(0)+en.slice(1).toLowerCase():"";
+const pd=()=>mobile()?{paddingTopLeft:[16,60],paddingBottomRight:[16,$("aside").offsetHeight+16]}:{paddingTopLeft:[40,40],paddingBottomRight:[40,40]};
+async function jget(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json()}
+const xv=(v,m)=>m.lo?-v:v;
+const bin=(v,m)=>{const x=xv(v,m);let b=0;for(let i=0;i<m.lim.length;i++)if(x>=m.lim[i])b=i;return b};
+
+// ---- 台風 ----
+function rt(r,o){if(!r||!r[o+1])return"なし";const d=r[o],lg=Math.round(r[o+1]),sh=Math.round(r[o+2]||r[o+1]);
+  return d>=1&&d<=8&&sh<lg?`${DN[d]}側${lg}km（その他${sh}km）`:`${lg}km`}
+function nowHTML(){
+  const s=S[sel];if(!s)return `<p class="note">現在、発生中の台風はありません（気象庁が台風情報を発表している間だけ表示されます）。観測値と警報・注意報は下に表示します。</p>`;
+  const n=s.now,lb=n.lb||{},w=n.wind==null?null:Math.round(n.wind),
+    kind=[lb.category,lb.intensity,lb.scale].filter(Boolean).join(" ")||(w!=null?cls(w):"");
+  const t=(a,b,c,x)=>`<div${x?` class="${x}"`:""}><small>${a}</small><strong>${b}${c?`<span>${c}</span>`:""}</strong></div>`;
+  return `<div class="kpi">
+   <div class="w2"><small>${T(n.t)} 現在（日本時間）</small><strong style="color:${w!=null?col(w):"var(--ink)"}">台風${s.no}号 ${esc(nm(s.en))}</strong><span style="display:block;color:var(--sub);font-size:12px">${esc(kind)}</span></div>
+   ${t("中心位置",`${n.lat.toFixed(1)}°N ${n.lon.toFixed(1)}°E`,"")}
+   ${t("中心気圧",n.pres?Math.round(n.pres):"-","hPa")}
+   ${t("最大風速（中心付近）",w!=null?w:"-","m/s")}
+   ${t("最大瞬間風速",n.gust!=null?Math.round(n.gust):"-","m/s")}
+   ${t("進行方向・速度",esc(n.course||"-"),n.speed!=null?` ${Math.round(n.speed)}km/h`:"")}
+   <div class="w2"><small>暴風域（風速25m/s以上）</small><strong style="font-size:14px">${rt(n.r,0)}</strong></div>
+   <div class="w2"><small>強風域（風速15m/s以上）</small><strong style="font-size:14px">${rt(n.r,3)}</strong></div></div>`}
+function fcHTML(){
+  const s=S[sel];if(!s)return`<p class="note">台風が発生していません</p>`;
+  if(!s.fc.length)return`<p class="note">この台風の進路予報はまだ発表されていません</p>`;
+  return `<table class="tb"><tr><th>日時</th><th>中心位置</th><th>気圧</th><th>風速</th><th>予報円</th></tr>`+
+   s.fc.map((p,i)=>`<tr data-fi="${i}" style="cursor:pointer"><td>${DH(p.t)}<br><small>+${p.h}時間</small></td><td>${p.lat.toFixed(1)}N<br>${p.lon.toFixed(1)}E</td><td>${p.pres?Math.round(p.pres):"-"}</td>
+    <td>${p.wind!=null?Math.round(p.wind):"-"}${p.gust!=null?`<br><small>瞬間${Math.round(p.gust)}</small>`:""}</td>
+    <td>${p.circle?Math.round(p.circle):"-"}${p.storm?`<br><small>警戒${Math.round(p.storm)}</small>`:""}</td></tr>`).join("")+
+   `</table><div class="note" style="margin-top:6px">気圧 hPa／風速・瞬間風速 m/s／予報円・暴風警戒域の半径 km。行をタップすると地図がその位置へ移ります。</div>`}
+// 予報円どうしを外接線でつないだ帯（強風域・暴風域の帯と同じ作り）
+function band(cs,o){if(cs.length<2)return null;
+  const P=cs.map(x=>wzCirc(x.c,x.r,6).map(wzM)),polys=P.slice(1).map((g,j)=>[wzHull(P[j].concat(g))]);let g=null;
+  try{if(window.polygonClipping)g=polygonClipping.union(...polys).map(pg=>pg.map(rg=>rg.map(wzU)))}catch(e){g=null}
+  if(!g)g=polys.map(pg=>[(wzArea(pg[0])<0?pg[0].slice().reverse():pg[0]).map(wzU)]);
+  return L.polygon(g,Object.assign({pane:"lvtk",interactive:false,lineJoin:"round"},o))}
+function drawStorm(){
+  trkL.clearLayers();radL.clearLayers();const s=S[sel];if(!s)return;
+  const n=s.now,c0=[n.lat,n.lon],F=s.fc.filter(p=>p.lat!=null);
+  if(s.past.length>1)L.polyline(s.past.concat([c0]),{pane:"lvtk",color:"#cbd5e1",weight:2.5,dashArray:"2 6",opacity:.9,interactive:false}).addTo(trkL);
+  const b1=band([{c:c0,r:1}].concat(F.filter(p=>p.circle).map(p=>({c:[p.lat,p.lon],r:p.circle}))),{stroke:false,fillColor:"#fff",fillOpacity:.1});if(b1)b1.addTo(trkL);
+  const b2=band([{c:c0,r:(n.r&&n.r[1])||1}].concat(F.filter(p=>p.storm).map(p=>({c:[p.lat,p.lon],r:p.storm}))),{color:"#fb7185",weight:1.5,fillColor:"#ef4444",fillOpacity:.14});if(b2)b2.addTo(trkL);
+  L.polyline([c0].concat(F.map(p=>[p.lat,p.lon])),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false}).addTo(trkL);
+  F.forEach(p=>{
+    if(p.circle)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:1.4,fill:false,interactive:false}).addTo(trkL);
+    L.circleMarker([p.lat,p.lon],{pane:"lvtk",radius:4,color:"#0a1120",weight:1,fillColor:p.wind!=null?col(Math.round(p.wind)):"#fff",fillOpacity:1})
+     .bindTooltip(`+${p.h}時間（${DH(p.t)}）<br>${p.pres?Math.round(p.pres)+"hPa ":""}${p.wind!=null?Math.round(p.wind)+"m/s":""}${p.circle?`<br>予報円 半径${Math.round(p.circle)}km`:""}`).addTo(trkL);
+    L.marker([p.lat,p.lon],{pane:"lvtk",icon:L.divIcon({className:"mlab2",html:`<span>${DH(p.t)}</span>`,iconSize:[0,0]}),interactive:false,keyboard:false}).addTo(trkL)});
+  const w=n.wind==null?null:Math.round(n.wind);
+  L.marker(c0,{pane:"lvtk",icon:L.divIcon({className:"mkw",html:`<span class="mk cur" style="--s:18px;--f:${w!=null?col(w):"#fff"};--r:#fff"></span>`,iconSize:[34,34]}),keyboard:false})
+   .bindTooltip(`台風${s.no}号 ${esc(nm(s.en))}<br>${T(n.t)}現在 ${n.pres?Math.round(n.pres)+"hPa ":""}${w!=null?w+"m/s":""}`).addTo(trkL);
+  if(n.r)["r30","r50"].forEach(k=>{const g=wzShape(n.lat,n.lon,n.r,k);
+    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",fillColor:WZC[k],fillOpacity:.16,interactive:false}).addTo(radL)});
+}
+// ---- 観測 ----
+function tip(r){return `<b>${esc(r[1])}</b>`+[r[4]!=null?`風 ${fv(r[4])}m/s${r[5]!=null?"（"+D16[r[5]]+"）":""}`:"",r[6]!=null?`最大瞬間 ${fv(r[6])}m/s`:"",
+  r[7]!=null?`海面気圧 ${fv(r[7])}hPa`:"",r[8]!=null?`1時間雨量 ${fv(r[8])}mm`:"",r[9]!=null?`3時間雨量 ${fv(r[9])}mm`:"",r[10]!=null?`24時間雨量 ${fv(r[10])}mm`:""].filter(Boolean).map(x=>"<br>"+x).join("")}
+function rowsOf(m){if(!obs)return[];return obs.rows.filter(r=>r[m.i]!=null&&(m.all||r[m.i]>0)).sort((a,b)=>xv(b[m.i],m)-xv(a[m.i],m))}   // 強い順
+function drawObs(){
+  obsL.clearLayers();mk={};if(!obs)return;const m=MET[met];
+  rowsOf(m).slice().reverse().forEach(r=>{const b=bin(r[m.i],m),c=L.circleMarker([r[2],r[3]],{renderer:cv,radius:3+b*1.3,color:"#0a1120",weight:1,fillColor:COLS[b],fillOpacity:.92}).bindTooltip(tip(r),{direction:"top"});
+    c.addTo(obsL);mk[r[0]]=c})}
+function metHTML(){
+  if(!obs)return`<p class="note" style="grid-column:span 2">観測値を取得できませんでした。「更新」で再試行してください</p>`;
+  return Object.entries(MET).map(([k,m])=>{const r=rowsOf(m)[0];
+    return `<button type="button" class="mt${k==met?" on":""}" data-m="${k}"><small>${m.s}</small><strong>${r?fv(r[m.i]):"-"}<span>${r?m.u:""}</span></strong><em>${r?esc(r[1]):"観測なし"}</em></button>`}).join("")}
+function topHTML(){
+  const m=MET[met],R=rowsOf(m).slice(0,10);$("#lvTopT").textContent=`${m.n}（${m.lo?"低い":"高い"}順 上位10地点）`;
+  if(!R.length)return`<li style="cursor:default"><span>観測値がありません</span></li>`;
+  return R.map((r,i)=>`<li data-st="${r[0]}"><span>${i+1}. ${esc(r[1])}${met=="wind"&&r[5]!=null?`<small style="color:var(--sub)"> ${D16[r[5]]}</small>`:""}</span><b style="color:${COLS[bin(r[m.i],m)]}">${fv(r[m.i])}${m.u}</b></li>`).join("")}
+// ---- 警報・注意報 ----
+function warnHTML(){
+  if(!wrn){$("#lvWsum").innerHTML="";return`<p class="note">警報・注意報を取得できませんでした。「更新」で再試行してください</p>`}
+  const all=$("#lvAll").checked,
+    rows=wrn.offices.map(o=>{const w=o.w.filter(x=>all||REL.has(x.c));return w.length?{...o,w,lv:Math.max(...w.map(x=>x.lv))}:null}).filter(Boolean).sort((a,b)=>b.lv-a.lv||b.n-a.n||(a.code<b.code?-1:1));
+  const cnt=l=>rows.filter(o=>o.lv==l).length;
+  $("#lvWsum").innerHTML=[[3,"特別警報"],[2,"警報"],[1,"注意報"]].map(([l,t])=>`<span class="pill"><b>${cnt(l)}</b> ${t}（地域数）</span>`).join("");
+  if(!rows.length)return`<p class="note">現在、発表中の${all?"":"台風に関係する"}警報・注意報はありません</p>`;
+  return rows.map(o=>`<div class="wr l${o.lv}"><b>${esc(o.name)}</b>${o.w.map(x=>`<em class="wb l${x.lv}">${esc(x.name)}</em>`).join("")}<small>${o.n?o.n+"市町村等":""}</small></div>`).join("")}
+// ---- 描画まとめ ----
+function renderStorm(){$("#lvNow").innerHTML=nowHTML();$("#lvFc").innerHTML=fcHTML();drawStorm();apply()}
+function renderObs(){$("#lvMet").innerHTML=metHTML();$("#lvTop").innerHTML=topHTML();drawObs();apply();if(active)legend2()}
+function renderWarn(){$("#lvWarn").innerHTML=warnHTML()}
+function apply(){[[trkL,vis.trk],[radL,vis.rad],[obsL,vis.obs]].forEach(([g,on])=>(active&&on)?g.addTo(map):g.remove())}
+function legendHTML(){const m=MET[met],lb=m.lb||RN(m.lim);
+  return `<div class="lgh">${m.n}（${m.u}）</div>`+COLS.map((c,i)=>`<div><i class="dot" style="--s:${6+i*1.3}px;background:${c}"></i>${lb[i]}</div>`).join("")+
+   `<div class="lgh">台風</div><div><i style="background:${WZC.r50}"></i>暴風域</div><div><i style="background:${WZC.r30}"></i>強風域</div>`}
+function legend2(){if(tab=="lv")$("#legend").innerHTML=legendHTML()}
+function setNote(t){$("#lnote").textContent=t}
+function noteTimes(){const a=[];if(S[sel])a.push(`台風 ${T(S[sel].now.t)}`);if(obs)a.push(`アメダス ${T(obs.t)}`);if(wrn&&wrn.t)a.push(`警報 ${T(wrn.t)}`);
+  setNote(a.length?`${a.join(" ／ ")}（日本時間）`:"データを取得できませんでした。「更新」で再試行してください")}
+function fit(){const ll=[];const s=S[sel];
+  if(s){ll.push([s.now.lat,s.now.lon]);s.past.forEach(p=>ll.push(p));s.fc.forEach(p=>{ll.push([p.lat,p.lon]);if(p.circle){const d=p.circle/111;ll.push([p.lat+d,p.lon+d],[p.lat-d,p.lon-d])}})}
+  if(ll.length)map.fitBounds(L.latLngBounds(ll),pd());else map.fitBounds([[22,122],[46,148]],pd())}
+async function loadAll(manual){
+  const my=++seq;if(manual)setNote("更新中…");
+  const [a,b,c]=await Promise.allSettled([jget("/api/live/storms"),jget("/api/live/amedas"),jget("/api/live/warnings")]);
+  if(my!=seq)return;
+  const keep=S[sel]&&S[sel].tc;
+  S=a.status=="fulfilled"?(a.value.storms||[]):[];sel=Math.max(0,S.findIndex(s=>s.tc==keep));
+  $("#lsel").innerHTML=S.length?S.map((s,i)=>`<option value="${i}">台風${s.no}号 ${esc(nm(s.en))}</option>`).join(""):`<option>${a.status=="fulfilled"?"発生中の台風はありません":"台風情報を取得できません"}</option>`;
+  $("#lsel").disabled=!S.length;$("#lsel").value=String(sel);
+  obs=b.status=="fulfilled"?b.value:null;wrn=c.status=="fulfilled"?c.value:null;loadedAt=Date.now();
+  renderStorm();renderObs();renderWarn();noteTimes();
+  if(active&&!fitted){fitted=true;fit()}}
+// ---- 操作 ----
+const tg=(id,k)=>$(id).onclick=e=>{vis[k]=!vis[k];e.currentTarget.classList.toggle("on",vis[k]);apply()};
+tg("#lvTrk","trk");tg("#lvRad","rad");tg("#lvObs","obs");
+$("#lsel").onchange=e=>{sel=+e.target.value;renderStorm();noteTimes();fit()};
+$("#lrf").onclick=()=>loadAll(true);
+$("#lvAll").onchange=renderWarn;
+$("#lvMet").onclick=e=>{const b=e.target.closest("[data-m]");if(!b)return;met=b.dataset.m;renderObs()};
+$("#lvTop").onclick=e=>{const li=e.target.closest("[data-st]");if(!li)return;const c=mk[li.dataset.st];if(!c)return;
+  vis.obs=true;$("#lvObs").classList.add("on");apply();map.setView(c.getLatLng(),Math.max(map.getZoom(),8));c.openTooltip()};
+$("#lvFc").onclick=e=>{const tr=e.target.closest("[data-fi]");if(!tr)return;const p=S[sel].fc[+tr.dataset.fi];map.setView([p.lat,p.lon],Math.max(map.getZoom(),5))};
+function show(){active=true;apply();
+  if(!ready){ready=true;loadAll()}else if(Date.now()-loadedAt>4*60e3)loadAll();
+  clearInterval(timer);timer=setInterval(()=>{if(active&&!document.hidden)loadAll()},5*60e3)}
+function hide(){active=false;clearInterval(timer);apply()}
+document.addEventListener("visibilitychange",()=>{if(active&&!document.hidden&&Date.now()-loadedAt>4*60e3)loadAll()});
+return{show,hide,fit,legend:legendHTML};
 })();
 
 // ================= 起動 =================
