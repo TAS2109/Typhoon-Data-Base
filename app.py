@@ -1147,6 +1147,12 @@ DET = {"UKM": "UKMET", "NGX": "NAVGEM", "CMC": "CMC", "JTWC": "JTWC公式", "AVN
 # a-deck に載っているものを自動検出する（載っていない機関は黙って飛ばし、画面の注記に「無いモデル」として出す）
 ENS_LET = {"A": "GEFS", "C": "CMC-EPS", "N": "NAVGEM-EPS", "E": "ECMWF-ENS", "U": "UKMET-ENS", "J": "JMA-GEPS"}
 ENS_ID = re.compile(r"([A-Z])(P\d\d|C00|E00)")
+# a-deck に載っている「上のDETに無いモデル」も自動で拾う。既知の名前だけ日本語表記にし、それ以外は技術IDのまま出す
+CON_ID = {"TVCN": "合成TVCN", "TVCX": "合成TVCX", "GUNA": "合成GUNA", "CONW": "合成CONW", "TCON": "合成TCON", "ICNW": "合成ICNW"}
+EXTRA_NAME = {"COTC": "COAMPS-TC(COTC)", "HWFI": "HWRF(補間)", "HMON": "HMON", "ECM2": "ECMWF(ECM2)", "EGRR": "UKMET(EGRR)",
+              "NVGM": "NAVGEM(NVGM)", "GFDN": "GFDN", "AEMN": "GEFS平均"}
+SKIP_TECH = {"BEST", "CARQ", "WRNG", "TCLP", "SHIP", "DSHP", "LGEM", "SHFR", "SHF5", "OFCL", "OFCI", "NAME", "SHNS", "DRCL", "OCD5", "XTRP", "CLIP", "CLP5"}
+EXTRA_MAX = 10   # 自動検出で足すモデルの上限（画面が混まないように）
 
 # Google DeepMind Weather Lab（AIの台風アンサンブル。WNV3=64メンバー、FNV3=50メンバー、GENC=GenCast）
 # URLは環境変数 WEATHERLAB_URL で差し替え可（{model} {kind} {ts} が置換される）。/api/fdiag で取得状況とCSVの列名を確認できる
@@ -1334,7 +1340,28 @@ def build_forecast(sid, jma=""):
         i = max(d)
         if datetime.strptime(i, "%Y%m%d%H") < top - timedelta(hours=48) or len(d[i]) < 2: return None
         return i, [d[i][t] for t in sorted(d[i])]
-    models = [{"key": t, "label": lb, "init": g[0], "pts": [list(x) for x in g[1]]} for t, lb in DET.items() if (g := last(t))]
+    models = []
+    for t, lb in DET.items():  # 同じモデルが別IDで載っている時（EMX/ECMF など）は、初期時刻が新しい方だけ残す
+        if not (g := last(t)): continue
+        m = {"key": t, "label": lb, "init": g[0], "pts": [list(x) for x in g[1]], "grp": "off" if lb == "JTWC公式" else "det"}
+        old = next((x for x in models if x["label"] == lb), None)
+        if old is None: models.append(m)
+        elif m["init"] > old["init"]: models[models.index(old)] = m
+    # --- DETに無い技術IDを自動検出（合成予報・その他のモデル）。補間版(…I)・アンサンブル・強度のみのガイダンスは除く
+    sig = lambda pts: tuple((x[0], x[1], x[2]) for x in pts[:4])
+    seen = {sig(m["pts"]) for m in models}
+    extra = 0
+    for t in sorted(by):
+        if extra >= EXTRA_MAX: break
+        if t in DET or t in SKIP_TECH or re.fullmatch(r"[A-Z](EMN|EMI|P\d\d|C00|E00)", t): continue
+        if t.endswith("I") and (t[:-1] in by or t[:-1] in DET): continue
+        if not (g := last(t)): continue
+        pts = [list(x) for x in g[1]]
+        if any(x[1] == 0 and x[2] == 0 for x in pts) or max(x[0] for x in pts) < 24: continue
+        if len({(x[1], x[2]) for x in pts}) < 2 or sig(pts) in seen: continue
+        seen.add(sig(pts)); extra += 1
+        models.append({"key": t, "label": CON_ID.get(t) or EXTRA_NAME.get(t) or t, "init": g[0], "pts": pts,
+                       "grp": "con" if t in CON_ID else "etc"})
     # --- a-deck のアンサンブル（機関ごとに自動検出）
     fam = {}
     for tech in sorted(by):
@@ -1393,6 +1420,87 @@ def build_forecast(sid, jma=""):
             "intensity": {"series": ser},
             "sources": {"adeck": bool(rows), "weatherlab": wst, "weatherlab_ok": wl_ok, "errors": errs,
                         "members": sum(e["n"] for e in ens)}}
+
+# ---------------- 似た過去の台風 ----------------
+import bisect
+
+def _enu(a, b):
+    """a→b の (東向き, 北向き) [km]（近距離用の平面近似）"""
+    return ((b[1] - a[1] + 540) % 360 - 180) * math.cos(math.radians((a[0] + b[0]) / 2)) * 111.195, (b[0] - a[0]) * 111.195
+
+def _at(trk, ts, t):
+    """時刻順の点列 trk=[(時刻,lat,lon,wind,pres)] の時刻 t での位置を線形補間 → (lat, lon, wind) / 範囲外は None"""
+    if t < ts[0] or t > ts[-1]: return None
+    i = bisect.bisect_left(ts, t)
+    if ts[i] == t: return trk[i][1], trk[i][2], trk[i][3]
+    a, b = trk[i - 1], trk[i]
+    f = (t - a[0]).total_seconds() / (b[0] - a[0]).total_seconds()
+    dlo = (b[2] - a[2] + 540) % 360 - 180
+    w = None if a[3] is None or b[3] is None else a[3] + (b[3] - a[3]) * f
+    return a[1] + (b[1] - a[1]) * f, a[2] + dlo * f, w
+
+def find_analogs(la, lo, doy, w, fc, n=5):
+    """現在位置・今後の動き(予報fc={tau:(lat,lon)})・季節・強さが近い過去の台風。1台風につき最も近い時点を1つ返す。
+    スコア = 位置差/150km + 進路差(+24/48/72hの位置の食い違い)/150km + 季節差/40日 + 強さの差/15m/s（小さいほど似ている）"""
+    lo = (lo + 180) % 360 - 180
+    cut = (datetime.now(timezone.utc) + timedelta(hours=9) - timedelta(days=14)).strftime(F)  # 活動中・直近の台風は除く
+    box = q("SELECT p.sid, p.time FROM points p JOIN typhoons t ON t.sid=p.sid WHERE t.end_time < ? "
+            "AND p.lat BETWEEN ? AND ? AND p.lon BETWEEN ? AND ?", (cut, la - 5, la + 5, lo - 8, lo + 8))
+    hit = {}
+    for r in box: hit.setdefault(r["sid"], set()).add(r["time"][:19])
+    if not hit: return []
+    sids = sorted(hit); trk = {}
+    for i in range(0, len(sids), 400):
+        ch = sids[i:i + 400]
+        for r in q(f"SELECT sid, time, lat, lon, wind, pres FROM points WHERE sid IN ({','.join('?' * len(ch))}) ORDER BY sid, time", ch):
+            trk.setdefault(r["sid"], []).append((datetime.strptime(r["time"][:19], F), r["lat"], r["lon"], r["wind"], r["pres"]))
+    meta = {r["sid"]: r for r in q("SELECT sid, title, year, max_wind, min_pres FROM typhoons")}
+    taus = sorted(t for t in fc if t in (24, 48, 72))
+    fv = {t: _enu((la, lo), fc[t]) for t in taus}
+    out = []
+    for sid in sids:
+        pts = trk.get(sid) or []
+        if len(pts) < 4 or sid not in meta: continue
+        ts = [p[0] for p in pts]; best = None
+        for p in pts:
+            if p[0].strftime(F) not in hit[sid]: continue
+            d0 = ll_dist((la, lo), (p[1], p[2]))
+            if d0 > 500: continue
+            errs, fut = [], []
+            for t in (24, 48, 72):
+                x = _at(pts, ts, p[0] + timedelta(hours=t))
+                if x is None: continue
+                fut.append([t, round(x[0], 1), round(x[1], 1), to_ms(x[2])])
+                if t in fv:
+                    e = _enu((p[1], p[2]), (x[0], x[1])); errs.append(math.hypot(e[0] - fv[t][0], e[1] - fv[t][1]))
+            if taus and (not errs or 24 not in [f[0] for f in fut]): continue
+            miss = len([t for t in taus if t not in [f[0] for f in fut]])
+            rms = math.sqrt(sum(e * e for e in errs) / len(errs)) + 100 * miss if errs else 0
+            dd = abs(p[0].timetuple().tm_yday - doy); dd = min(dd, 365 - dd)
+            wi = abs(w - to_ms(p[3])) if (w and p[3]) else 0
+            sc = d0 / 150 + rms / 150 + dd / 40 + wi / 15
+            if best is None or sc < best[0]: best = (sc, p, d0, rms, fut)
+        if best is None: continue
+        sc, p, d0, rms, fut = best
+        th = [[round(x[1], 2), round(x[2], 2), to_ms(x[3])] for x in pts][::2]
+        mi = min(range(len(th)), key=lambda i: (th[i][0] - p[1]) ** 2 + (th[i][1] - p[2]) ** 2)
+        m = meta[sid]
+        out.append({"sid": sid, "title": m["title"], "year": m["year"], "time": p[0].strftime(F), "lat": round(p[1], 1), "lon": round(p[2], 1),
+                    "w": to_ms(p[3]), "d0": round(d0), "err": round(rms) if taus else None, "score": round(sc, 2),
+                    "max_wind": to_ms(m["max_wind"]), "min_pres": m["min_pres"], "fut": fut, "track": th, "mi": mi})
+    return sorted(out, key=lambda r: r["score"])[:n]
+
+@app.get("/api/analogs")
+def api_analogs(lat: float, lon: float, doy: int = 0, w: float = 0, fc: str = "", n: int = Query(5, ge=1, le=8)):
+    """fc = '24:lat:lon,48:lat:lon,72:lat:lon'（基準にする予報進路）"""
+    f = {}
+    for x in fc.split(","):
+        try:
+            t, a, b = x.split(":"); f[int(t)] = (float(a), float(b))
+        except ValueError: continue
+    key = f"an:{lat:.1f}:{lon:.1f}:{doy}:{w:.0f}:{sorted(f.items())}:{n}"
+    try: return _cached(key, 600, lambda: find_analogs(lat, lon, doy, w, f, n))
+    except sqlite3.OperationalError: return []
 
 @app.get("/api/forecast/storms")
 def fc_storms():
@@ -1531,6 +1639,9 @@ footer{padding:8px 16px;border-top:1px solid var(--line);color:var(--sub);font-s
 .mk{display:block;width:var(--s);height:var(--s);border-radius:50%;background:var(--f);box-shadow:0 0 0 2px #0a1120,0 0 0 5px var(--r)}
 .mk.cur{box-shadow:0 0 0 2px #0a1120,0 0 0 5px var(--r),0 0 0 7px #fff}
 .mlab2{background:none;border:0}
+.sum{background:var(--s2);border-radius:10px;padding:8px 12px;font-size:13px;line-height:1.7}.sum b{display:block;font-size:12px;color:var(--sub);margin-bottom:2px}
+.anr{display:block;width:100%;margin-top:6px;text-align:left;background:var(--s2);border:0;border-radius:10px;padding:8px 12px;cursor:pointer}
+.anr b{display:block;font-size:13px}.anr small{display:block;color:var(--sub);font-size:11px;line-height:1.5;font-variant-numeric:tabular-nums}.anr.on{outline:2px solid var(--acc)}
 .mlab2 span{position:absolute;left:12px;top:-9px;padding:0 5px;border-radius:5px;background:rgba(10,17,32,.88);color:#fff;font:700 11px system-ui,sans-serif;white-space:nowrap}
 
 /* ---- 統計 ---- */
@@ -1627,10 +1738,11 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
  <section id="s-fc" class="sec">
   <div class="pad">
    <div class="sel"><select id="fsel" aria-label="予報を見る台風"></select><button type="button" class="btn" id="frf">更新</button></div>
-   <div class="rw"><span class="lb">予報時間</span><input id="tau" type="range" min="0" max="120" step="6" value="48" aria-label="予報時間"><b id="tv">+48h</b></div>
+   <div class="rw"><span class="lb">予報時間</span><button type="button" class="btn sm" id="play" aria-label="再生" style="padding:0 10px">▶</button><input id="tau" type="range" min="0" max="120" step="6" value="48" aria-label="予報時間"><b id="tv">+48h</b></div>
    <div id="fnote" class="note"></div>
   </div>
   <div class="scroll">
+   <div id="fsum" class="sum" hidden></div>
    <h3 class="sh">選んだ時間の予報（位置と強さ）</h3><div id="pos"></div>
    <h3 class="sh">強さの表示</h3>
    <div class="btns"><button type="button" class="btn on" id="oInlay">線を強さで色分け</button><button type="button" class="btn" id="oNum">風速を数字で</button>
@@ -1638,6 +1750,9 @@ table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:ta
    <div class="note" style="margin-top:6px">進路線は、極細の外枠の色が予報の出どころ（モデル）、内側の実線の色が強さです。印も同じで、中の色と大きさが強さ、外側の輪がモデル。円は単独モデル、菱形はアンサンブル平均。ボタンを切ると線はモデルの色だけになります。</div>
    <h3 class="sh">ソース（タップで表示・非表示）</h3><div id="fchips"></div>
    <label class="chk"><input type="checkbox" id="mem" checked>アンサンブルの各メンバーの進路も表示</label>
+   <h3 class="sh">似た過去の台風</h3>
+   <label class="chk" style="margin-top:0"><input type="checkbox" id="anOn" checked>地図に重ねる（細い線＝それまで、太い線＝その後）</label>
+   <div id="an"></div>
    <h3 class="sh">詳しく見る</h3>
    <div class="btns"><button type="button" class="btn" id="tbl">位置のばらつき表</button><button type="button" class="btn" id="int">強さ予報のグラフ</button></div>
    <div id="fsrc" class="note" style="margin-top:16px"></div>
@@ -2035,13 +2150,15 @@ $("#stBody").addEventListener("click",e=>{
 // 表現のルール:  線と外側の輪の色 = 予報の出どころ(モデル) / 印の中の色と大きさ = 強さ / 円 = 単独モデル、菱形 = アンサンブル平均
 const FC=(()=>{
 const COL={"JMA公式":"#ffffff",UKMET:"#ff8a3d",NAVGEM:"#a78bfa",CMC:"#34d399",GEFS:"#38bdf8","CMC-EPS":"#10b981","NAVGEM-EPS":"#c4b5fd",ECMWF:"#f43f5e",GFS:"#facc15","JMA-GSM":"#f9a8d4","JTWC公式":"#ef4444","ECMWF-ENS":"#fb7185","UKMET-ENS":"#fb923c","JMA-GEPS":"#e879f9","WeatherNext3(AI)":"#22d3ee","WeatherNext2(AI)":"#2dd4bf","GenCast(AI)":"#a3e635"};
-const colr=k=>COL[k]||"#94a3b8";
-const GN={off:"公式予報",det:"単独モデル",ens:"アンサンブル平均",ai:"AIモデル（アンサンブル）"};
+const PAL=["#f59e0b","#14b8a6","#8b5cf6","#ec4899","#84cc16","#0ea5e9","#f97316","#22c55e","#e11d48","#06b6d4"];
+const colr=k=>COL[k]||PAL[[...String(k)].reduce((a,c)=>a+c.charCodeAt(0),0)%PAL.length];
+const GN={off:"公式予報",det:"単独モデル",con:"合成予報（複数モデルの平均）",ens:"アンサンブル平均",ai:"AIモデル（アンサンブル）",etc:"その他（取得元で検出したモデル）"};
 const KT=0.514444;
 const w10=(kt,is10)=>kt?kt*KT*(is10?1:.88):null;   // ATCFの1分間平均を気象庁の10分間平均相当(×0.88)
 const kls=(kt,is10)=>{const v=w10(kt,is10);return v==null?UNKF:FCLS.find(c=>v>=c[0])};
 const itxt=(kt,hp,is10)=>{const v=w10(kt,is10),k=kls(kt,is10);return [v!=null?`${v.toFixed(0)}m/s`:"",hp?`${Math.round(hp)}hPa`:"",v!=null?k[1]:""].filter(Boolean).join(" ")};
-const tm=L.layerGroup(),ana=L.layerGroup();
+const tm=L.layerGroup(),ana=L.layerGroup(),anL=L.layerGroup();
+let an=[],anSel=-1,anSeq=0,pt=null;
 let items=[],d=null,ref=140,ready=false,active=false,met="w",fitFor="";
 const opt={step:24,inlay:true,num:false};
 const w=lo=>lo+360*Math.round((ref-lo)/360);   // 日付変更線をまたいでも線が飛ばないよう経度を連続化
@@ -2083,13 +2200,13 @@ function build(){
   base=(d.analysis&&d.analysis.init)||(d.jma&&d.jma.init)||"";
   const add=(label,init,pts,o={})=>{const it={label,init,pts,c:colr(label),g:L.layerGroup(),visible:true,is10:!!o.is10,ens:!!o.ens,dash:o.dash,big:o.big,grp:o.grp,tag:o.tag||""};items.push(it);return it};
   if(d.jma)add("JMA公式",d.jma.init,d.jma.pts,{big:1,is10:true,grp:"off"});
-  d.models.forEach(m=>add(m.label,m.init,m.pts,{grp:m.label=="JTWC公式"?"off":"det"}));
+  d.models.forEach(m=>add(m.label,m.init,m.pts,{grp:m.grp||(m.label=="JTWC公式"?"off":"det")}));
   d.ens.forEach(e=>{const it=add(e.label,e.init,e.mean,{dash:"6 5",ens:true,grp:/\(AI\)$/.test(e.label)?"ai":"ens",tag:`${e.n}メンバー`});it.members=e.members;
     it.mem=L.layerGroup();e.members.forEach(m=>L.polyline(m.map(x=>[x[1],w(x[2])]),{color:it.c,weight:1,opacity:.3,interactive:false}).addTo(it.mem))});
   if(!base)base=items.map(i=>i.init).filter(Boolean).sort().pop()||"";
   items.forEach(draw);
   if(d.analysis)L.circleMarker([d.analysis.lat,w(d.analysis.lon)],{radius:6,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip("解析位置 "+fmt(d.analysis.init)+"（日本時間）").addTo(ana);
-  $("#fchips").innerHTML=["off","det","ens","ai"].map(g=>{const a=items.map((it,i)=>[it,i]).filter(([it])=>it.grp==g);
+  $("#fchips").innerHTML=["off","det","con","ens","ai","etc"].map(g=>{const a=items.map((it,i)=>[it,i]).filter(([it])=>it.grp==g);
     return a.length?`<button type="button" class="gh" data-g="${g}"><span>${GN[g]}</span><span>まとめて切り替え</span></button><div class="srcs">${a.map(([it,i])=>`<button type="button" class="src" data-i="${i}" style="--c:${it.c}"><i class="ln${it.ens?" d":""}"></i>${esc(it.label)}<small>${fmt(it.init)}${it.tag?" "+it.tag:""}</small></button>`).join("")}</div>`:""}).join("");
   const mx=Math.min(240,Math.max(24,...items.map(i=>i.pts.length?i.pts[i.pts.length-1][0]:0)));
   $("#tau").max=mx;if(+$("#tau").value>mx)$("#tau").value=48;
@@ -2098,12 +2215,12 @@ function build(){
     (s.weatherlab_ok?" ＋ Google DeepMind Weather Lab（AI）":"")+"。"+(d.jma?"公式予報は気象庁。":"")+`アンサンブル計${s.members||0}メンバー。`+
     (miss.length?`この取得元に無いモデル: ${miss.join("・")}。`:"")+"風速は10分間平均相当（モデルは1分間平均×0.88）。予報は参考値です。防災には気象庁の情報を確認してください。";
   setNote(`${items.length}種類のソースを表示中`);
-  apply();
+  apply();summary();loadAn();
   if(active&&fitFor!=d.id){fitFor=d.id;fit()}
 }
 function apply(){items.forEach(it=>{const on=active&&it.visible;on?it.g.addTo(map):it.g.remove();
   if(it.mem)(on&&$("#mem").checked)?it.mem.addTo(map):it.mem.remove()});
-  document.querySelectorAll("#fchips .src").forEach(b=>b.classList.toggle("off",!items[+b.dataset.i].visible));marks()}
+  document.querySelectorAll("#fchips .src").forEach(b=>b.classList.toggle("off",!items[+b.dataset.i].visible));(active&&$("#anOn").checked)?anL.addTo(map):anL.remove();marks()}
 function marks(){tm.clearLayers();const t=+$("#tau").value,out=[];$("#tv").innerHTML=`+${t}h${base?`<small style="display:block;font-weight:400;font-size:11px;color:var(--sub)">${vt(base,t)}（日本時間）</small>`:""}`;
   items.forEach(it=>{if(!it.visible)return;const p=at(it.pts,t);if(!p)return;const q=atv(it.pts,t);
     mk(p[0],p[1],it.c,q[0],it.is10,{e:it.ens,cur:true}).addTo(tm);
@@ -2115,13 +2232,16 @@ const pad=()=>mobile()?{paddingTopLeft:[16,60],paddingBottomRight:[16,$("aside")
 function fit(){const ll=[];items.forEach(it=>it.pts.forEach(p=>ll.push([p[1],w(p[2])])));if(d&&d.analysis)ll.push([d.analysis.lat,w(d.analysis.lon)]);
   if(ll.length)map.fitBounds(L.latLngBounds(ll),pad())}
 function show(){active=true;ana.addTo(map);tm.addTo(map);if(!ready){ready=true;init()}else apply()}
-function hide(){active=false;items.forEach(i=>{i.g.remove();i.mem&&i.mem.remove()});ana.remove();tm.remove()}
+function hide(){active=false;stopPlay();anL.remove();items.forEach(i=>{i.g.remove();i.mem&&i.mem.remove()});ana.remove();tm.remove()}
 // 操作
 $("#fchips").onclick=e=>{
   const g=e.target.closest(".gh");
   if(g){const a=items.filter(i=>i.grp==g.dataset.g),on=!a.some(i=>i.visible);a.forEach(i=>i.visible=on);apply();return}
   const b=e.target.closest(".src");if(!b)return;const it=items[+b.dataset.i];it.visible=!it.visible;apply()};
-$("#mem").onchange=apply;$("#tau").oninput=marks;
+$("#mem").onchange=apply;$("#anOn").onchange=apply;$("#tau").oninput=()=>{stopPlay();marks()};
+function stopPlay(){if(pt){clearInterval(pt);pt=null}$("#play").textContent="▶"}
+$("#play").onclick=()=>{if(pt)return stopPlay();const s=$("#tau");if(+s.value>=+s.max)s.value=0;$("#play").textContent="⏸";marks();
+  pt=setInterval(()=>{const n=+s.value+6;if(n>+s.max)return stopPlay();s.value=n;marks()},700)};
 const tog=(id,k)=>$(id).onclick=e=>{opt[k]=!opt[k];e.currentTarget.classList.toggle("on",opt[k]);redraw()};
 tog("#oInlay","inlay");tog("#oNum","num");
 $("#oStep").onchange=e=>{opt.step=+e.target.value;redraw()};
@@ -2164,6 +2284,45 @@ $("#int").onclick=openInt;
 $("#dlg").addEventListener("click",e=>{const dl=$("#dlg");
   if(e.target===dl||e.target.closest("[data-close]"))return dl.close();
   const b=e.target.closest("[data-met]");if(b){met=b.dataset.met;openInt()}});
+// 見通しのまとめ・似た過去の台風
+const refItem=()=>items.find(i=>i.label=="JMA公式")||items.find(i=>i.ens&&i.pts.length)||items.find(i=>i.pts.length)||null;
+const km=(a,b)=>{const r=Math.PI/180,x=Math.sin((b[0]-a[0])*r/2)**2+Math.cos(a[0]*r)*Math.cos(b[0]*r)*Math.sin((b[1]-a[1])*r/2)**2;return 12742*Math.asin(Math.sqrt(x))};
+const brg=(a,b)=>{const r=Math.PI/180,dl=(b[1]-a[1])*r,y=Math.sin(dl)*Math.cos(b[0]*r),x=Math.cos(a[0]*r)*Math.sin(b[0]*r)-Math.sin(a[0]*r)*Math.cos(b[0]*r)*Math.cos(dl);return(Math.atan2(y,x)/r+360)%360};
+const dirj=a=>["北","北東","東","南東","南","南西","西","北西"][Math.round(a/45)%8];
+const r10=v=>Math.round(v/10)*10;
+function summary(){const el=$("#fsum"),r=refItem();if(!r||!d){el.hidden=true;return}
+  const p0=at(r.pts,0)||[r.pts[0][1],w(r.pts[0][2])],T=[72,48,24].find(t=>at(r.pts,t)),bt=t=>base?`（${vt(base,t)}）`:"";
+  let h=`<b>${esc(r.label)}の見通し</b>`;
+  if(T){const p=at(r.pts,T);h+=`<div>${T}時間後${bt(T)}は${dirj(brg(p0,p))}へ約${r10(km(p0,p))}km（${p[0].toFixed(1)}N ${((p[1]%360+360)%360).toFixed(1)}E）</div>`}
+  let pk=null;r.pts.forEach(p=>{const v=w10(p[3],r.is10);if(v!=null&&(!pk||v>pk[0]))pk=[v,p[0],p[3]]});
+  if(pk)h+=`<div>ピーク ${Math.round(pk[0])}m/s（${kls(pk[2],r.is10)[1]}）・${pk[1]?`+${pk[1]}h${bt(pk[1])}`:"現在"}</div>`;
+  const sp=d.spread,i=sp.taus.indexOf(72),m=sp.max[i];
+  if(m!=null&&sp.n[i]>=2)h+=`<div>72時間後のモデル間のばらつき: <b>${m<150?"小（ほぼ一致）":m<300?"中":"大（意見が割れています）"}</b>（最大約${r10(m)}km・${sp.n[i]}ソース）</div>`;
+  el.innerHTML=h;el.hidden=false}
+async function loadAn(){const my=++anSeq,r=refItem();an=[];anSel=-1;anL.clearLayers();
+  if(!d||!r){$("#an").innerHTML="";return}
+  $("#an").innerHTML='<p class="note">似た台風を探しています…</p>';
+  const a0=d.analysis?[d.analysis.lat,d.analysis.lon]:[r.pts[0][1],r.pts[0][2]],wd=d.analysis&&d.analysis.w?w10(d.analysis.w,false):w10(r.pts[0][3],r.is10)||0;
+  const t0=base?iso(base):Date.now(),doy=Math.floor((t0-Date.UTC(new Date(t0).getUTCFullYear(),0,0))/864e5);
+  const fc=[24,48,72].map(t=>{const p=at(r.pts,t);return p?`${t}:${p[0].toFixed(1)}:${p[1].toFixed(1)}`:""}).filter(Boolean).join(",");
+  try{const x=await fetch(`/api/analogs?lat=${a0[0]}&lon=${a0[1]}&doy=${doy}&w=${(wd||0).toFixed(0)}&fc=${fc}&n=5`);if(!x.ok)throw 0;const j=await x.json();if(my!=anSeq)return;an=j;anList();drawAn()}
+  catch(e){if(my==anSeq)$("#an").innerHTML='<p class="note">似た台風を取得できませんでした</p>'}}
+function anList(){
+  if(!an.length){$("#an").innerHTML='<p class="note">近い動きをした過去の台風は見つかりませんでした</p>';return}
+  $("#an").innerHTML=an.map((a,i)=>{const f=a.fut.find(x=>x[0]==72)||a.fut[a.fut.length-1],p=[a.lat,a.lon];
+    const fu=f?`その後${f[0]}h: ${dirj(brg(p,[f[1],f[2]]))}へ約${r10(km(p,[f[1],f[2]]))}km${a.w!=null&&f[3]!=null?` ・ ${a.w}→${f[3]}m/s`:""}`:"";
+    return `<button type="button" class="anr${i==anSel?" on":""}" data-i="${i}"><b>${esc(a.title)}</b>
+     <small>${a.time.slice(0,4)}年${+a.time.slice(5,7)}/${+a.time.slice(8,10)}時点 ${a.lat}N ${a.lon}E ・ 位置差${a.d0}km${a.err!=null?` ・ 進路差${a.err}km`:""}</small>
+     <small>${fu}${fu?" ・ ":""}最大${a.max_wind??"-"}m/s${a.min_pres?` ${Math.round(a.min_pres)}hPa`:""}</small></button>`}).join("")+
+    '<div class="note" style="margin-top:6px">現在位置・予報の動き・季節・強さが近い過去の台風です。同じ経過をたどるとは限らない参考表示です（気象庁ベストトラック準拠）。</div>'}
+function anLL(a){const sh=360*Math.round((ref-a.lon)/360);let pv=null;return a.track.map(([la,lo])=>{lo+=sh;if(pv!==null){while(lo-pv>180)lo-=360;while(lo-pv<-180)lo+=360}pv=lo;return[la,lo]})}
+function drawAn(){anL.clearLayers();an.forEach((a,i)=>{const on=i==anSel,ll=anLL(a),tip=`${a.title}（${a.time.slice(0,4)}年）`,sh=360*Math.round((ref-a.lon)/360);
+  const go=()=>selAn(i);
+  L.polyline(ll.slice(0,a.mi+1),{color:"#cbd5e1",weight:on?2:1.5,opacity:on?.7:.35}).bindTooltip(esc(tip)).on("click",go).addTo(anL);
+  L.polyline(ll.slice(a.mi),{color:on?"#ffffff":"#cbd5e1",weight:on?4:2.5,opacity:on?1:.75}).bindTooltip(esc(tip)).on("click",go).addTo(anL);
+  L.circleMarker([a.lat,a.lon+sh],{radius:5,color:"#fff",weight:2,fillColor:"#0a1120",fillOpacity:1}).bindTooltip(esc(tip)+" 比較の起点").on("click",go).addTo(anL)})}
+function selAn(i){anSel=i;anList();drawAn();const a=an[i];if(a)map.fitBounds(L.latLngBounds(anLL(a)),pad())}
+$("#an").onclick=e=>{const b=e.target.closest(".anr");if(b)selAn(+b.dataset.i)};
 // 読み込み
 async function load(){const o=$("#fsel").selectedOptions[0];if(!o)return;setNote("読み込み中…");
   try{const r=await fetch(`/api/forecast/${o.value}?jma=${o.dataset.jma||""}`);if(!r.ok)throw 0;d=await r.json();build()}
