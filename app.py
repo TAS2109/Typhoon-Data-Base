@@ -1731,7 +1731,8 @@ def live_storm(tc, tn):
                   if _jp(r.get(k)) not in (None, "-")}
             out["now"] = {"t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
                           "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"), "course": _jp(r.get("course")),
-                          "speed": _speed(r), "r": _r6(r), "lb": lb}
+                          "speed": _speed(r), "r": _r6(r), "lb": lb,
+                          "sz": _jp(r.get("scale"))}   # 気象庁の階級の原文（"大型" "超大型"。階級なしは "-"。項目が無ければ None）
             break
     for r in fc:
         if not isinstance(r, dict) or r.get("advancedHours") is None:
@@ -1746,7 +1747,7 @@ def live_storm(tc, tn):
             if out["now"] is None:  # specifications.json に実況が無い時は、forecast.json の実況点で代用
                 out["now"] = {"t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
                               "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"), "course": None, "speed": None,
-                              "r": None, "lb": {}}
+                              "r": None, "lb": {}, "sz": None}
             continue
         circ = next((v for k, v in r.items() if "circle" in str(k).lower()), None)  # 予報円
         out["fc"].append({"h": h, "t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
@@ -1853,29 +1854,57 @@ def _active_warnings(raw):
             st.setdefault(code, set()).update(cs)
     return st, reported
 
+PREF = {"01": "北海道", "02": "青森県", "03": "岩手県", "04": "宮城県", "05": "秋田県", "06": "山形県", "07": "福島県", "08": "茨城県",
+        "09": "栃木県", "10": "群馬県", "11": "埼玉県", "12": "千葉県", "13": "東京都", "14": "神奈川県", "15": "新潟県", "16": "富山県",
+        "17": "石川県", "18": "福井県", "19": "山梨県", "20": "長野県", "21": "岐阜県", "22": "静岡県", "23": "愛知県", "24": "三重県",
+        "25": "滋賀県", "26": "京都府", "27": "大阪府", "28": "兵庫県", "29": "奈良県", "30": "和歌山県", "31": "鳥取県", "32": "島根県",
+        "33": "岡山県", "34": "広島県", "35": "山口県", "36": "徳島県", "37": "香川県", "38": "愛媛県", "39": "高知県", "40": "福岡県",
+        "41": "佐賀県", "42": "長崎県", "43": "熊本県", "44": "大分県", "45": "宮崎県", "46": "鹿児島県", "47": "沖縄県"}
+
+def _to_c10(area, code):
+    """地域コード（市町村等・一次細分区域）→ 一次細分区域（class10s）のコード。市町村等(7桁)→class15s→class10s と親へ上がる。"""
+    code = str(code)
+    c10 = area.get("class10s", {})
+    if len(code) == 6 and code in c10:
+        return code
+    cur = code
+    for lv in ("class20s", "class15s"):
+        a = area.get(lv, {}).get(cur)
+        if a and a.get("parent"):
+            cur = a["parent"]
+    return cur if cur in c10 else None
+
+def _area_name(area, c10):
+    """一次細分区域の表示名。「山梨県中・西部」のように都道府県名を頭に付ける。
+    伊豆諸島・小笠原諸島や北海道の「〇〇地方」、名前に県名が入っているもの（大阪府・東京地方・沖縄本島中南部）はそのまま。"""
+    cn = area["class10s"][c10].get("name", c10)
+    pn = PREF.get(c10[:2], "")
+    if not pn or c10[:2] == "01" or "諸島" in cn or cn.startswith(pn[:-1]):
+        return cn
+    return pn + cn
+
 def live_warnings():
     area = _cached("lv:area", 86400, lambda: _jget(AREA_URL))
     st, reported = _active_warnings(_jget(WARN_URL))
-    cities = {code: {c: 1 for c in cs} for code, cs in st.items()}   # 地域コード → {警報コード: 1}
-    offices = {}
-    for code, ws in cities.items():
-        oc = _to_office(area, code)
-        if not oc:
+    areas = {}   # 一次細分区域コード → 表示用のまとめ
+    for code, ws in st.items():
+        c10 = _to_c10(area, code)
+        if not c10:
             continue
-        o = offices.setdefault(oc, {"code": oc, "name": area["offices"][oc].get("name", oc), "n": 0, "w": {}})
+        o = areas.setdefault(c10, {"code": c10, "name": _area_name(area, c10), "n": 0, "w": {}})
         is20 = code in area.get("class20s", {})
         o["n"] += 1 if is20 else 0
         for c in ws:
-            o["w"][c] = o["w"].get(c, 0) + (1 if is20 else 0)
+            o["w"][c] = o["w"].get(c, 0) + (1 if is20 else 0)   # 警報コード → 発表中の市町村等の数
     out = []
-    for o in offices.values():
+    for o in areas.values():
         ws = [{"c": c, "name": W_NAME.get(c, c), "lv": w_level(c), "k": max(k, 1)} for c, k in o["w"].items()]
         ws.sort(key=lambda x: (-x["lv"], -x["k"]))
         out.append({"code": o["code"], "name": o["name"], "n": o["n"], "w": ws})
     # 地図の塗りつぶし用: 地域コード(6桁=1次細分区域 / 7桁=市町村等) → 発表中の警報コード
     c10 = {k: sorted(v) for k, v in st.items() if len(k) == 6}
     c20 = {k: sorted(v) for k, v in st.items() if len(k) == 7}
-    return {"t": reported, "offices": sorted(out, key=lambda o: o["code"]), "c10": c10, "c20": c20}
+    return {"t": reported, "areas": sorted(out, key=lambda o: o["code"]), "c10": c10, "c20": c20}
 
 @app.get("/api/live/geo/{name}")
 def api_geo(name: str):
@@ -1923,7 +1952,7 @@ def live_diag():
         out["amedas_error"] = repr(e)
     try:
         w = live_warnings()
-        out["warnings"] = {"time": w["t"], "offices": len(w["offices"]), "sample": w["offices"][:3]}
+        out["warnings"] = {"time": w["t"], "areas": len(w["areas"]), "sample": w["areas"][:3]}
     except Exception as e:
         out["warnings_error"] = repr(e)
     return PlainTextResponse(json.dumps(out, ensure_ascii=False, indent=1)[:60000])
@@ -2285,7 +2314,8 @@ const UNKF=[null,"不明","#3d4f66",8];
 // 台風の大きさ（気象庁）: 強風域(15m/s以上)の最大半径が 500km以上=大型、800km以上=超大型。全タブ共通
 const SZ=[[800,"超大型","#f0abfc"],[500,"大型","#c084fc"]];
 const szK=km=>km?SZ.find(z=>km>=z[0])||null:null;
-const szJ=(km,lb)=>szK(km)||(lb?(/超大型/.test(lb)?SZ[0]:/大型/.test(lb)?SZ[1]:null):null);   // 半径が無い時は気象庁の階級の文字で代用
+// 気象庁の階級（lb）が取れていればそれを優先（"-" は階級なし=大型未満）。取れない時だけ強風域の半径から判定する
+const szJ=(km,lb)=>{if(typeof lb==="string"&&lb.trim()){const t=lb.trim();if(t.indexOf("超大型")>=0)return SZ[0];if(t.indexOf("大型")>=0)return SZ[1];if(t==="-")return null}return szK(km)};
 const szTag=(km,lb)=>{const z=szJ(km,lb);return z?`<em class="sz" style="--c:${z[2]}">${z[1]}</em>`:""};
 const szLg=()=>`<div class="lgh">大きさ（強風域の半径）</div>`+SZ.slice().reverse().map(z=>`<div><i style="background:${z[2]}"></i>${z[1]} ${z[0]}km以上</div>`).join("");
 const initHash=location.hash.slice(1);
@@ -2958,16 +2988,16 @@ function nowHTML(){const c=cur();if(!c.length)return `<p class="note">現在、�
 function nowOne(s){
   const n=s.now,lb=n.lb||{},w=n.wind==null?null:Math.round(n.wind),
     kind=[lb.category,lb.intensity].filter(Boolean).join(" ")||(w!=null?cls(w):""),
-    zg=n.r&&n.r[4]?n.r[4]:null,z=szJ(zg,lb.scale);
+    zg=n.r&&n.r[4]?n.r[4]:null,z=szJ(zg,n.sz);
   const t=(a,b,c,x)=>`<div${x?` class="${x}"`:""}><small>${a}</small><strong>${b}${c?`<span>${c}</span>`:""}</strong></div>`;
   return `<div class="kpi">
-   <div class="w2"><small>${T(n.t)} 現在（日本時間）</small><strong style="color:${w!=null?col(w):"var(--ink)"}">台風${s.no}号 ${esc(nm(s.en))}</strong><span style="display:block;color:var(--sub);font-size:12px">${esc(kind)}${z?szTag(zg,lb.scale):""}</span></div>
+   <div class="w2"><small>${T(n.t)} 現在（日本時間）</small><strong style="color:${w!=null?col(w):"var(--ink)"}">台風${s.no}号 ${esc(nm(s.en))}</strong><span style="display:block;color:var(--sub);font-size:12px">${esc(kind)}${z?szTag(zg,n.sz):""}</span></div>
    ${t("中心位置",`${n.lat.toFixed(1)}°N ${n.lon.toFixed(1)}°E`,"")}
    ${t("中心気圧",n.pres?Math.round(n.pres):"-","hPa")}
    ${t("最大風速（中心付近）",w!=null?w:"-","m/s")}
    ${t("最大瞬間風速",n.gust!=null?Math.round(n.gust):"-","m/s")}
    ${t("進行方向・速度",esc(n.course||"-"),n.speed!=null?` ${Math.round(n.speed)}km/h`:"")}
-   <div class="w2"><small>大きさ（強風域の最大半径で判定）</small><strong style="font-size:14px">${z?z[1]:zg?"大型未満":"不明"}${zg?`（強風域 最大${Math.round(zg)}km）`:""}</strong></div>
+   <div class="w2"><small>大きさ（気象庁の階級。無い時は強風域の最大半径で判定）</small><strong style="font-size:14px">${z?z[1]:zg?"大型未満":"不明"}${zg?`（強風域 最大${Math.round(zg)}km）`:""}</strong></div>
    <div class="w2"><small>暴風域（風速25m/s以上）</small><strong style="font-size:14px">${rt(n.r,0)}</strong></div>
    <div class="w2"><small>強風域（風速15m/s以上）</small><strong style="font-size:14px">${rt(n.r,3)}</strong></div></div>`}
 function fcHTML(){const c=cur();if(!c.length)return`<p class="note">台風が発生していません</p>`;
@@ -2984,14 +3014,14 @@ function band(cs,o){if(cs.length<2)return null;
   const P=cs.map(x=>wzCirc(x.c,x.r,6).map(wzM)),polys=P.slice(1).map((g,j)=>[wzHull(P[j].concat(g))]);let g=null;
   try{if(window.polygonClipping)g=polygonClipping.union(...polys).map(pg=>pg.map(rg=>rg.map(wzU)))}catch(e){g=null}
   if(!g)g=polys.map(pg=>[(wzArea(pg[0])<0?pg[0].slice().reverse():pg[0]).map(wzU)]);
-  return L.polygon(g,Object.assign({pane:"lvtk",interactive:false,lineJoin:"round"},o))}
+  return L.polygon(g,Object.assign({pane:"lvtk",interactive:false,lineJoin:"round",noClip:true},o))}
 function drawStorm(){trkL.clearLayers();radL.clearLayers();cur().forEach(drawOne)}
 function drawOne(s){
   const n=s.now,c0=[n.lat,n.lon],F=s.fc.filter(p=>p.lat!=null);
-  if(s.past.length>1)L.polyline(s.past.concat([c0]),{pane:"lvtk",color:"#cbd5e1",weight:2.5,dashArray:"2 6",opacity:.9,interactive:false}).addTo(trkL);
+  if(s.past.length>1)L.polyline(s.past.concat([c0]),{pane:"lvtk",color:"#cbd5e1",weight:2.5,dashArray:"2 6",opacity:.9,interactive:false,noClip:true}).addTo(trkL);
   const b1=band([{c:c0,r:1}].concat(F.filter(p=>p.circle).map(p=>({c:[p.lat,p.lon],r:p.circle}))),{stroke:false,fillColor:"#fff",fillOpacity:.1});if(b1)b1.addTo(trkL);
   const b2=band([{c:c0,r:(n.r&&n.r[1])||1}].concat(F.filter(p=>p.storm).map(p=>({c:[p.lat,p.lon],r:p.storm}))),{color:"#fb7185",weight:1.5,fillColor:"#ef4444",fillOpacity:.14});if(b2)b2.addTo(trkL);
-  L.polyline([c0].concat(F.map(p=>[p.lat,p.lon])),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false}).addTo(trkL);
+  L.polyline([c0].concat(F.map(p=>[p.lat,p.lon])),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false,noClip:true}).addTo(trkL);
   F.forEach(p=>{
     if(p.circle)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:1.4,fill:false,interactive:false}).addTo(trkL);
     L.circleMarker([p.lat,p.lon],{pane:"lvtk",radius:4,color:"#0a1120",weight:1,fillColor:p.wind!=null?col(Math.round(p.wind)):"#fff",fillOpacity:1})
@@ -3002,7 +3032,7 @@ function drawOne(s){
    .bindTooltip(`台風${s.no}号 ${esc(nm(s.en))}<br>${T(n.t)}現在 ${n.pres?Math.round(n.pres)+"hPa ":""}${w!=null?w+"m/s":""}`).addTo(trkL);
   if(cur().length>1)L.marker(c0,{pane:"lvtk",icon:L.divIcon({className:"mlab2",html:`<span>台風${s.no}号</span>`,iconSize:[0,0]}),interactive:false,keyboard:false}).addTo(trkL);
   if(n.r)["r30","r50"].forEach(k=>{const g=wzShape(n.lat,n.lon,n.r,k);
-    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",fillColor:WZC[k],fillOpacity:.16,interactive:false}).addTo(radL)});
+    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",fillColor:WZC[k],fillOpacity:.16,interactive:false,noClip:true}).addTo(radL)});
 }
 // ---- 観測 ----
 function tip(r){return `<b>${esc(r[1])}</b>`+[r[4]!=null?`風 ${fv(r[4])}m/s${r[5]!=null?"（"+D16[r[5]]+"）":""}`:"",r[6]!=null?`最大瞬間 ${fv(r[6])}m/s`:"",
@@ -3010,39 +3040,20 @@ function tip(r){return `<b>${esc(r[1])}</b>`+[r[4]!=null?`風 ${fv(r[4])}m/s${r[
 // 範囲: 台風が発生中で距離を選んだ時だけ、台風の中心からその距離内の地点に絞る（0=全国）
 // 観測値の範囲「自動」: 強風域の最大半径（無ければ強さから推定）に、強いほど大きい係数をかけて、近い段階(km)へ切り上げる。超えたら全国(0)
 const RSTEP=[300,500,700,1000,1500];
-const wReach={};   // 台風のtc → その台風に最も近い(担当する)発表地域のうち、台風の中心から最も遠い所までの距離[km]
-const WEXT=new Set(["07","16","37","47","08","19","38","48"]);   // 波浪・高潮: 注意報から対象（遠くにも発表されやすい）
-const wxOK=c=>REL.has(c)&&(WEXT.has(c)||wlv(c)>=2);               // それ以外の台風関係は警報級(警報以上)だけ対象
-let rcSeq=0;
-async function calcReach(){
-  const my=++rcSeq,old=JSON.stringify(wReach);Object.keys(wReach).forEach(k=>delete wReach[k]);
-  const codes=(wrn&&wrn.c10)?Object.keys(wrn.c10).filter(k=>(wrn.c10[k]||[]).some(wxOK)):[];
-  if(codes.length&&S.length){
-    try{if(!geo.c10)geo.c10=await gj("class10s")}catch(e){geo.c10=null}
-    if(my!=rcSeq)return;
-    if(geo.c10){
-      const bb={},scan=(c,b)=>{if(typeof c[0]=="number"){b[0]=Math.min(b[0],c[1]);b[1]=Math.max(b[1],c[1]);b[2]=Math.min(b[2],c[0]);b[3]=Math.max(b[3],c[0])}else c.forEach(x=>scan(x,b))};
-      (geo.c10.features||[]).forEach(f=>{const k=(f.properties||{}).code;if(!codes.includes(k)||!f.geometry)return;
-        const b=bb[k]||(bb[k]=[90,-90,180,-180]);scan(f.geometry.coordinates,b)});
-      codes.forEach(k=>{const b=bb[k];if(!b)return;const p=[(b[0]+b[1])/2,(b[2]+b[3])/2];   // 地域の外接矩形の中心
-        let bi=-1,bd=1e9;S.forEach((s,i)=>{const d=km([s.now.lat,s.now.lon],p);if(d<bd){bd=d;bi=i}});   // 一番近い台風の担当にする
-        if(bi>=0){const t=S[bi].tc;wReach[t]=Math.max(wReach[t]||0,bd)}})}}
-  if(my==rcSeq&&JSON.stringify(wReach)!=old)renderObs()}
 function autoR0(s){const n=s.now,w=n.wind==null?null:Math.round(n.wind),g=n.r&&n.r[4]?n.r[4]:null,
   base=g??(w==null||w<33?300:w<44?350:w<54?400:450),fac=w==null||w<33?1.2:w<44?1.3:w<54?1.4:1.5,need=Math.max(300,base*fac);
   return RSTEP.find(x=>x>=need)||0}   // 台風の強さ・大きさだけで決めた範囲（0=全国）
-// 波浪・高潮はうねりや潮位で台風から遠く離れた所にも発表される。強さ・大きさの範囲の外に発表地域があれば、そこまで範囲を広げる（超えたら全国）
-function autoR(s){const r=autoR0(s),e=wReach[s.tc]||0;return !r||e<=r?r:(RSTEP.find(x=>x>=e)||0)}   // 最大段階(1500km)を超えたら全国(0)
-function autoWhy(s){const r=autoR0(s),e=wReach[s.tc]||0;return r&&e>r?`警報・注意報（波浪・高潮など）の発表地域が台風の中心から約${Math.round(e/10)*10}km先まで及ぶため、強さ・大きさだけで決めた${r}kmから${autoR(s)?autoR(s)+"km":"全国"}に広げています。`:""}
+// 自動の範囲は台風の強さ・大きさだけで決める（警報・注意報の発表状況では変えない）
+const autoR=autoR0;
 const rv=s=>{const v=$("#lvRng").value;return v=="auto"?autoR(s):+v};
 const rngAll=()=>{const r=cur().map(s=>[s,rv(s)]);return r.some(x=>!x[1])?[]:r};   // [[台風, 半径km]]。空なら全国
 const rng=()=>{const r=rngAll();return r.length?Math.max(...r.map(x=>x[1])):0};
 function rngInfo(){const c=cur(),s=c[0],A=$("#lvRngA"),N=$("#lvRngN");
   if(!s){A.textContent="自動（台風の強さ・大きさに合わせる）";N.textContent="";return}
-  if(c.length>1){A.textContent=`自動（${c.map(t=>{const r=autoR(t);return `${t.no}号 ${r?r+"km":"全国"}`}).join("・")}）`;N.textContent=$("#lvRng").value=="auto"?"各台風の強さ・大きさ（と警報・注意報の発表地域）から範囲を決め、どれかの台風の範囲に入る地点の最大値を見ます。"+c.map(autoWhy).filter(Boolean).join(""):"";return}
-  const R=autoR(s),n=s.now,w=n.wind==null?null:Math.round(n.wind),g=n.r&&n.r[4]?n.r[4]:null,z=szJ(g,(n.lb||{}).scale);
+  if(c.length>1){A.textContent=`自動（${c.map(t=>{const r=autoR(t);return `${t.no}号 ${r?r+"km":"全国"}`}).join("・")}）`;N.textContent=$("#lvRng").value=="auto"?"各台風の強さ・大きさから範囲を決め、どれかの台風の範囲に入る地点の最大値を見ます。":"";return}
+  const R=autoR(s),n=s.now,w=n.wind==null?null:Math.round(n.wind),g=n.r&&n.r[4]?n.r[4]:null,z=szJ(g,n.sz);
   A.textContent=`自動（${R?`台風の中心から${R}km以内`:"全国"}）`;
-  N.textContent=$("#lvRng").value=="auto"?`強さ「${w!=null?cls(w):"不明"}」・大きさ「${z?z[1]:g?"大型未満":"不明"}」${g?`（強風域 最大${Math.round(g)}km）`:""}から、初期の範囲を${R?R+"km以内":"全国"}にしています。強いほど、大きいほど広く見ます。${autoWhy(s)}`:""}
+  N.textContent=$("#lvRng").value=="auto"?`強さ「${w!=null?cls(w):"不明"}」・大きさ「${z?z[1]:g?"大型未満":"不明"}」${g?`（強風域 最大${Math.round(g)}km）`:""}から、初期の範囲を${R?R+"km以内":"全国"}にしています。強いほど、大きいほど広く見ます。`:""}
 function rowsOf(m){if(!obs)return[];const rs=rngAll();
   return obs.rows.filter(r=>r[m.i]!=null&&(m.all||r[m.i]>0)&&(!rs.length||rs.some(([s,R])=>km([s.now.lat,s.now.lon],[r[2],r[3]])<=R))).sort((a,b)=>xv(b[m.i],m)-xv(a[m.i],m))}   // 強い順
 function drawObs(){
@@ -3063,7 +3074,7 @@ function topHTML(){
 function warnHTML(){
   if(!wrn){$("#lvWsum").innerHTML="";return`<p class="note">警報・注意報を取得できませんでした。「更新」で再試行してください</p>`}
   const all=$("#lvAll").checked,
-    rows=wrn.offices.map(o=>{const w=o.w.filter(x=>all||REL.has(x.c));return w.length?{...o,w,lv:Math.max(...w.map(x=>x.lv))}:null}).filter(Boolean).sort((a,b)=>b.lv-a.lv||b.n-a.n||(a.code<b.code?-1:1));
+    rows=wrn.areas.map(o=>{const w=o.w.filter(x=>all||REL.has(x.c));return w.length?{...o,w,lv:Math.max(...w.map(x=>x.lv))}:null}).filter(Boolean).sort((a,b)=>b.lv-a.lv||b.n-a.n||(a.code<b.code?-1:1));
   const cnt=l=>rows.filter(o=>o.lv==l).length;
   $("#lvWsum").innerHTML=[[4,"特別警報"],[3,"危険警報"],[2,"警報"],[1,"注意報"]].map(([l,t])=>`<span class="pill"><b>${cnt(l)}</b> ${t}（地域数）</span>`).join("");
   if(!rows.length)return`<p class="note">現在、発表中の${all?"":"台風に関係する"}警報・注意報はありません</p>`;
@@ -3079,7 +3090,7 @@ function wnLevel(codes,all){let m=0;for(const c of codes||[])if(all||REL.has(c))
 function wnLayer(data,tbl,all){
   return L.geoJSON(data,{filter:f=>wnLevel(tbl[(f.properties||{}).code],all)>0,style:f=>{
     const l=wnLevel(tbl[f.properties.code],all),[c,a]=WNC[l];
-    return {pane:"lvwn",renderer:cvw,interactive:false,color:c,weight:f.properties.islandBold?5:.8,opacity:l==4?.9:.55,fillColor:c,fillOpacity:a,lineJoin:"round"}}})}
+    return {pane:"lvwn",renderer:cvw,interactive:false,noClip:true,color:c,weight:f.properties.islandBold?5:.8,opacity:l==4?.9:.55,fillColor:c,fillOpacity:a,lineJoin:"round"}}})}
 async function drawWarn(){
   const my=++wnSeq;wnL.clearLayers();if(!wrn||!wrn.c10)return;
   const all=$("#lvAll").checked;
@@ -3120,10 +3131,10 @@ async function loadAll(manual){
   if(my!=seq)return;
   const keep=sel<0?"":((S[sel]&&S[sel].tc)||"");
   S=a.status=="fulfilled"?(a.value.storms||[]):[];sel=S.length>1?S.findIndex(s=>s.tc==keep):0;   // 複数ある時の既定は「すべて」(-1)
-  $("#lsel").innerHTML=S.length?(S.length>1?`<option value="-1">すべての台風（${S.length}個）</option>`:"")+S.map((s,i)=>{const z=szJ(s.now.r&&s.now.r[4],(s.now.lb||{}).scale);return `<option value="${i}">台風${s.no}号 ${esc(nm(s.en))}${z?`（${z[1]}）`:""}</option>`}).join(""):`<option>${a.status=="fulfilled"?"発生中の台風はありません":"台風情報を取得できません"}</option>`;
+  $("#lsel").innerHTML=S.length?(S.length>1?`<option value="-1">すべての台風（${S.length}個）</option>`:"")+S.map((s,i)=>{const z=szJ(s.now.r&&s.now.r[4],s.now.sz);return `<option value="${i}">台風${s.no}号 ${esc(nm(s.en))}${z?`（${z[1]}）`:""}</option>`}).join(""):`<option>${a.status=="fulfilled"?"発生中の台風はありません":"台風情報を取得できません"}</option>`;
   $("#lsel").disabled=!S.length;$("#lsel").value=String(sel);
   obs=b.status=="fulfilled"?b.value:null;wrn=c.status=="fulfilled"?c.value:null;loadedAt=Date.now();
-  renderStorm();renderObs();renderWarn();noteTimes();calcReach();
+  renderStorm();renderObs();renderWarn();noteTimes();
   if(active&&!fitted){fitted=true;fit()}}
 // ---- 操作 ----
 const tg=(id,k)=>$(id).onclick=e=>{vis[k]=!vis[k];e.currentTarget.classList.toggle("on",vis[k]);apply();if(k=="wrn"){if(vis.wrn)drawWarn();legend2()}};
