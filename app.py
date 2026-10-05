@@ -1700,6 +1700,17 @@ def _circle_km(v):
         return None
     return walk(v)
 
+def _sane_km(v, raw=None, tag=""):
+    """半径[km]の妥当性チェック。予報円・暴風警戒域は実際には数百km〜千数百km。
+    3000kmを超える値は単位がメートルの可能性が高いので1000で割る。それでも範囲外なら読めなかったことにして生データをログに出す。"""
+    if v and v > 3000 and v <= 3_000_000:
+        v = v / 1000
+    if v and not (0 < v <= 3000):
+        v = None
+    if v is None and raw is not None:
+        print(f"live storm: {tag}の半径が範囲外です raw =", json.dumps(raw, ensure_ascii=False)[:400], flush=True)
+    return v
+
 def _iso_utc(v):
     s = str(v.get("UTC", "")) if isinstance(v, dict) else ""
     try:
@@ -1764,6 +1775,14 @@ def live_storm(tc, tn):
                           "speed": _speed(r), "r": _r6(r), "lb": lb,
                           "sz": _jp(r.get("scale"))}   # 気象庁の階級の原文（"大型" "超大型"。階級なしは "-"。項目が無ければ None）
             break
+    # 予報円の半径は specifications.json の各予報行 probabilityCircleRadius {"km":95,"nm":50} が確実（実データで確認済み）
+    sp_fc = {}
+    for r in spec:
+        if isinstance(r, dict) and isinstance(r.get("part"), dict) and r.get("advancedHours") not in (None, 0, "0"):
+            try:
+                sp_fc[int(r["advancedHours"])] = r
+            except (TypeError, ValueError):
+                pass
     for r in fc:
         if not isinstance(r, dict) or r.get("advancedHours") is None:
             continue
@@ -1780,10 +1799,14 @@ def live_storm(tc, tn):
                               "r": None, "lb": {}, "sz": None}
             continue
         ks = sorted(r.keys(), key=lambda k: ("probab" not in str(k).lower(), str(k)))   # probabilityCircle を最優先
-        circ = next((r[k] for k in ks if "circle" in str(k).lower()), None)  # 予報円
+        circ = next((r[k] for k in ks if "circle" in str(k).lower()), None)  # 予報円（forecast.json 側。specifications に無い時の予備）
+        sr = sp_fc.get(h, {})
         out["fc"].append({"h": h, "t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
                           "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"),
-                          "circle": _circle_km(circ), "storm": _circle_km(r.get("stormWarning"))})  # 暴風警戒域
+                          "circle": (_sane_km(_circle_km(sr.get("probabilityCircleRadius")), sr.get("probabilityCircleRadius"), "予報円(specifications)") if sr.get("probabilityCircleRadius") else None)
+                                    or _sane_km(_circle_km(circ), circ, "予報円(forecast)"),
+                          "storm": _sane_km(_circle_km(sr.get("stormWarning")), sr.get("stormWarning"), "暴風警戒域(specifications)")
+                                   or _sane_km(_circle_km(r.get("stormWarning")), r.get("stormWarning"), "暴風警戒域(forecast)")})  # 暴風警戒域
     out["fc"].sort(key=lambda p: p["h"])
     if out["fc"] and not any(p["circle"] for p in out["fc"]):
         k0 = next((r for r in fc if isinstance(r, dict) and r.get("advancedHours") not in (None, 0, "0")), {})
@@ -3067,7 +3090,7 @@ function drawOne(s){
   const b2=band([{c:c0,r:(n.r&&n.r[1])||1}].concat(F.filter(p=>p.storm).map(p=>({c:[p.lat,p.lon],r:p.storm}))),{fillColor:"#ef4444",fillOpacity:.14},{color:"#fb7185",weight:1.5});if(b2)b2.forEach(l=>l.addTo(trkL));
   L.polyline(unwrapLL([c0].concat(F.map(p=>[p.lat,p.lon]))),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false}).addTo(trkL);
   F.forEach(p=>{
-    if(p.circle)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:2,opacity:.95,fill:false,interactive:false}).addTo(trkL);
+    if(p.circle&&p.circle<=3000)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:2,opacity:.95,fill:false,interactive:false}).addTo(trkL);
     L.circleMarker([p.lat,p.lon],{pane:"lvtk",radius:4,color:"#0a1120",weight:1,fillColor:p.wind!=null?col(Math.round(p.wind)):"#fff",fillOpacity:1})
      .bindTooltip(`${cur().length>1?`台風${s.no}号 `:""}+${p.h}時間（${DH(p.t)}）<br>${p.pres?Math.round(p.pres)+"hPa ":""}${p.wind!=null?Math.round(p.wind)+"m/s":""}${p.circle?`<br>予報円 半径${Math.round(p.circle)}km`:""}`).addTo(trkL);
     L.marker([p.lat,p.lon],{pane:"lvtk",icon:L.divIcon({className:"mlab2",html:`<span>${DH(p.t)}</span>`,iconSize:[0,0]}),interactive:false,keyboard:false}).addTo(trkL)});
