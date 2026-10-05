@@ -3087,7 +3087,13 @@ function drawOne(s){
   const n=s.now,c0=[n.lat,n.lon],F=s.fc.filter(p=>p.lat!=null);
   if(s.past.length>1)L.polyline(unwrapLL(s.past.concat([c0])),{pane:"lvtk",color:"#cbd5e1",weight:2.5,dashArray:"2 6",opacity:.9,interactive:false}).addTo(trkL);
   const b1=band([{c:c0,r:1}].concat(F.filter(p=>p.circle).map(p=>({c:[p.lat,p.lon],r:p.circle}))),{fillColor:"#fff",fillOpacity:.1});if(b1)b1.forEach(l=>l.addTo(trkL));
-  const b2=band([{c:c0,r:(n.r&&n.r[1])||1}].concat(F.filter(p=>p.storm).map(p=>({c:[p.lat,p.lon],r:p.storm}))),{fillColor:"#ef4444",fillOpacity:.14},{color:"#fb7185",weight:1.5});if(b2)b2.forEach(l=>l.addTo(trkL));
+  // 暴風域・暴風警戒域: 実況→予報の順に並べ、半径のある点が続く区間ごとに帯にする（途中から発生・途中で消える場合に対応）。
+  // 1点だけの区間は円で描く。半径の無い点をまたいでつながない
+  {const seq=[{c:c0,r:(n.r&&n.r[1])||0}].concat(F.map(p=>({c:[p.lat,p.lon],r:p.storm||0}))),runs=[];let run=[];
+   seq.forEach(x=>{if(x.r>0)run.push(x);else{if(run.length)runs.push(run);run=[]}});if(run.length)runs.push(run);
+   runs.forEach(rn=>{
+     if(rn.length>1){const b=band(rn,{fillColor:"#ef4444",fillOpacity:.14},{color:"#fb7185",weight:1.5});if(b)b.forEach(l=>l.addTo(trkL))}
+     else if(rn[0].c!==c0)L.circle(rn[0].c,{pane:"lvtk",radius:rn[0].r*1000,color:"#fb7185",weight:1.5,fillColor:"#ef4444",fillOpacity:.14,interactive:false}).addTo(trkL)})}
   L.polyline(unwrapLL([c0].concat(F.map(p=>[p.lat,p.lon]))),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false}).addTo(trkL);
   F.forEach(p=>{
     if(p.circle&&p.circle<=3000)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:2,opacity:.95,fill:false,interactive:false}).addTo(trkL);
