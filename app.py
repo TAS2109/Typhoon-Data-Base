@@ -1670,6 +1670,36 @@ def _km(v):
         return next((x for x in map(_km, v) if x), None)
     return num(v)
 
+def _circle_km(v):
+    """予報円・暴風警戒域の半径[km]。辞書・配列の奥まで探し、km があればそれ、無ければ nm を換算する。
+    座標（basePoint / center など）は読み飛ばす。単位なしの radius / range は km とみなす。"""
+    def walk(x, d=0):
+        if d > 5:
+            return None
+        if isinstance(x, dict):
+            for key, f in (("km", 1), ("nm", NM)):
+                n = num(x.get(key))
+                if n:
+                    return n * f
+            for k, y in x.items():
+                if str(k).lower() in ("basepoint", "center", "position", "deg", "dms", "latlon") or not isinstance(y, (dict, list)):
+                    continue
+                r = walk(y, d + 1)
+                if r:
+                    return r
+            for k in ("radius", "range"):
+                n = num(x.get(k))
+                if n:
+                    return n
+        elif isinstance(x, list):
+            for y in x:
+                if isinstance(y, (dict, list)):
+                    r = walk(y, d + 1)
+                    if r:
+                        return r
+        return None
+    return walk(v)
+
 def _iso_utc(v):
     s = str(v.get("UTC", "")) if isinstance(v, dict) else ""
     try:
@@ -1749,11 +1779,15 @@ def live_storm(tc, tn):
                               "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"), "course": None, "speed": None,
                               "r": None, "lb": {}, "sz": None}
             continue
-        circ = next((v for k, v in r.items() if "circle" in str(k).lower()), None)  # 予報円
+        ks = sorted(r.keys(), key=lambda k: ("probab" not in str(k).lower(), str(k)))   # probabilityCircle を最優先
+        circ = next((r[k] for k in ks if "circle" in str(k).lower()), None)  # 予報円
         out["fc"].append({"h": h, "t": _iso_utc(r.get("validtime")), "lat": la, "lon": lo, "pres": num(r.get("pressure")),
                           "wind": _wind(r, "sustained"), "gust": _wind(r, "gust"),
-                          "circle": _km(circ), "storm": _km(r.get("stormWarning"))})  # 暴風警戒域
+                          "circle": _circle_km(circ), "storm": _circle_km(r.get("stormWarning"))})  # 暴風警戒域
     out["fc"].sort(key=lambda p: p["h"])
+    if out["fc"] and not any(p["circle"] for p in out["fc"]):
+        k0 = next((r for r in fc if isinstance(r, dict) and r.get("advancedHours") not in (None, 0, "0")), {})
+        print(f"live storm {tc}: 予報円の半径を読み取れません keys =", sorted(k0.keys()), flush=True)
     return out
 
 @app.get("/api/live/storms")
@@ -1940,7 +1974,9 @@ def live_diag():
         if t:
             tc = t["tropicalCyclone"]
             out["specifications"] = _jget(f"{BOSAI}/{tc}/specifications.json")
-            out["forecast(先頭3件)"] = (_jget(f"{BOSAI}/{tc}/forecast.json") or [])[:3]
+            fcj = _jget(f"{BOSAI}/{tc}/forecast.json") or []
+            out["forecast(予報2件)"] = [r for r in fcj if isinstance(r, dict) and r.get("advancedHours") not in (None, 0, "0")][:2]
+            out["forecast(先頭2件)"] = fcj[:2]
     except Exception as e:
         out["storm_error"] = repr(e)
     try:
@@ -3010,20 +3046,28 @@ function fcOne(s,si){
     <td>${p.circle?Math.round(p.circle):"-"}${p.storm?`<br><small>警戒${Math.round(p.storm)}</small>`:""}</td></tr>`).join("")+
    `</table>`}
 // 予報円どうしを外接線でつないだ帯（強風域・暴風域の帯と同じ作り）
-function band(cs,o){if(cs.length<2)return null;
+// 外形線は塗りと別の折れ線で描く。多角形に枠線を付けると、画面端で切られた所に偽の直線（経線・緯線のような線）が出るため
+function ringsOf(g){const o=[];(function f(x){if(!x.length)return;if(typeof x[0][0]==="number")o.push(x.concat([x[0]]));else x.forEach(f)})(g);return o}
+function outline(g,o){return L.polyline(ringsOf(g),Object.assign({pane:"lvtk",interactive:false,lineJoin:"round"},o))}
+// 予報円どうしを外接線でつないだ帯（強風域・暴風域の帯と同じ作り）。[塗り, 外形線] を返す
+function band(cs,fill,line){if(cs.length<2)return null;
   const P=cs.map(x=>wzCirc(x.c,x.r,6).map(wzM)),polys=P.slice(1).map((g,j)=>[wzHull(P[j].concat(g))]);let g=null;
   try{if(window.polygonClipping)g=polygonClipping.union(...polys).map(pg=>pg.map(rg=>rg.map(wzU)))}catch(e){g=null}
   if(!g)g=polys.map(pg=>[(wzArea(pg[0])<0?pg[0].slice().reverse():pg[0]).map(wzU)]);
-  return L.polygon(g,Object.assign({pane:"lvtk",interactive:false,lineJoin:"round",noClip:true},o))}
+  const r=[L.polygon(g,Object.assign({pane:"lvtk",interactive:false,stroke:false},fill))];
+  if(line&&window.polygonClipping)r.push(outline(g,line));
+  return r}
+// 日付変更線をまたぐ軌跡で、地図を横切る長い直線にならないよう、経度を連続させる
+function unwrapLL(a){const o=[];let k=0;a.forEach((p,i)=>{if(i){const d=p[1]+k-o[i-1][1];if(d>180)k-=360;else if(d<-180)k+=360}o.push([p[0],p[1]+k])});return o}
 function drawStorm(){trkL.clearLayers();radL.clearLayers();cur().forEach(drawOne)}
 function drawOne(s){
   const n=s.now,c0=[n.lat,n.lon],F=s.fc.filter(p=>p.lat!=null);
-  if(s.past.length>1)L.polyline(s.past.concat([c0]),{pane:"lvtk",color:"#cbd5e1",weight:2.5,dashArray:"2 6",opacity:.9,interactive:false,noClip:true}).addTo(trkL);
-  const b1=band([{c:c0,r:1}].concat(F.filter(p=>p.circle).map(p=>({c:[p.lat,p.lon],r:p.circle}))),{stroke:false,fillColor:"#fff",fillOpacity:.1});if(b1)b1.addTo(trkL);
-  const b2=band([{c:c0,r:(n.r&&n.r[1])||1}].concat(F.filter(p=>p.storm).map(p=>({c:[p.lat,p.lon],r:p.storm}))),{color:"#fb7185",weight:1.5,fillColor:"#ef4444",fillOpacity:.14});if(b2)b2.addTo(trkL);
-  L.polyline([c0].concat(F.map(p=>[p.lat,p.lon])),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false,noClip:true}).addTo(trkL);
+  if(s.past.length>1)L.polyline(unwrapLL(s.past.concat([c0])),{pane:"lvtk",color:"#cbd5e1",weight:2.5,dashArray:"2 6",opacity:.9,interactive:false}).addTo(trkL);
+  const b1=band([{c:c0,r:1}].concat(F.filter(p=>p.circle).map(p=>({c:[p.lat,p.lon],r:p.circle}))),{fillColor:"#fff",fillOpacity:.1});if(b1)b1.forEach(l=>l.addTo(trkL));
+  const b2=band([{c:c0,r:(n.r&&n.r[1])||1}].concat(F.filter(p=>p.storm).map(p=>({c:[p.lat,p.lon],r:p.storm}))),{fillColor:"#ef4444",fillOpacity:.14},{color:"#fb7185",weight:1.5});if(b2)b2.forEach(l=>l.addTo(trkL));
+  L.polyline(unwrapLL([c0].concat(F.map(p=>[p.lat,p.lon]))),{pane:"lvtk",color:"#fff",weight:2,opacity:.95,interactive:false}).addTo(trkL);
   F.forEach(p=>{
-    if(p.circle)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:1.4,fill:false,interactive:false}).addTo(trkL);
+    if(p.circle)L.circle([p.lat,p.lon],{pane:"lvtk",radius:p.circle*1000,color:"#fff",weight:2,opacity:.95,fill:false,interactive:false}).addTo(trkL);
     L.circleMarker([p.lat,p.lon],{pane:"lvtk",radius:4,color:"#0a1120",weight:1,fillColor:p.wind!=null?col(Math.round(p.wind)):"#fff",fillOpacity:1})
      .bindTooltip(`${cur().length>1?`台風${s.no}号 `:""}+${p.h}時間（${DH(p.t)}）<br>${p.pres?Math.round(p.pres)+"hPa ":""}${p.wind!=null?Math.round(p.wind)+"m/s":""}${p.circle?`<br>予報円 半径${Math.round(p.circle)}km`:""}`).addTo(trkL);
     L.marker([p.lat,p.lon],{pane:"lvtk",icon:L.divIcon({className:"mlab2",html:`<span>${DH(p.t)}</span>`,iconSize:[0,0]}),interactive:false,keyboard:false}).addTo(trkL)});
@@ -3032,17 +3076,18 @@ function drawOne(s){
    .bindTooltip(`台風${s.no}号 ${esc(nm(s.en))}<br>${T(n.t)}現在 ${n.pres?Math.round(n.pres)+"hPa ":""}${w!=null?w+"m/s":""}`).addTo(trkL);
   if(cur().length>1)L.marker(c0,{pane:"lvtk",icon:L.divIcon({className:"mlab2",html:`<span>台風${s.no}号</span>`,iconSize:[0,0]}),interactive:false,keyboard:false}).addTo(trkL);
   if(n.r)["r30","r50"].forEach(k=>{const g=wzShape(n.lat,n.lon,n.r,k);
-    if(g)L.polygon(g,{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",fillColor:WZC[k],fillOpacity:.16,interactive:false,noClip:true}).addTo(radL)});
+    if(g){L.polygon(g,{pane:"wz",stroke:false,fillColor:WZC[k],fillOpacity:.16,interactive:false}).addTo(radL);
+      L.polyline(g.concat([g[0]]),{pane:"wz",color:WZC[k],weight:2.5,dashArray:"7 5",interactive:false}).addTo(radL)}});
 }
 // ---- 観測 ----
 function tip(r){return `<b>${esc(r[1])}</b>`+[r[4]!=null?`風 ${fv(r[4])}m/s${r[5]!=null?"（"+D16[r[5]]+"）":""}`:"",r[6]!=null?`最大瞬間 ${fv(r[6])}m/s`:"",
   r[7]!=null?`海面気圧 ${fv(r[7])}hPa`:"",r[8]!=null?`1時間雨量 ${fv(r[8])}mm`:"",r[9]!=null?`3時間雨量 ${fv(r[9])}mm`:"",r[10]!=null?`24時間雨量 ${fv(r[10])}mm`:""].filter(Boolean).map(x=>"<br>"+x).join("")}
 // 範囲: 台風が発生中で距離を選んだ時だけ、台風の中心からその距離内の地点に絞る（0=全国）
-// 観測値の範囲「自動」: 強風域の最大半径（無ければ強さから推定）に、強いほど大きい係数をかけて、近い段階(km)へ切り上げる。超えたら全国(0)
+// 観測値の範囲「自動」: 強風域の最大半径（無ければ強さから推定）に、強いほど大きい係数をかけて、近い段階(km)へ切り上げる。超えたら上限の1500km
 const RSTEP=[300,500,700,1000,1500];
 function autoR0(s){const n=s.now,w=n.wind==null?null:Math.round(n.wind),g=n.r&&n.r[4]?n.r[4]:null,
   base=g??(w==null||w<33?300:w<44?350:w<54?400:450),fac=w==null||w<33?1.2:w<44?1.3:w<54?1.4:1.5,need=Math.max(300,base*fac);
-  return RSTEP.find(x=>x>=need)||0}   // 台風の強さ・大きさだけで決めた範囲（0=全国）
+  return RSTEP.find(x=>x>=need)||RSTEP[RSTEP.length-1]}   // 台風の強さ・大きさだけで決めた範囲（自動は最大でも1500km。全国にはしない）
 // 自動の範囲は台風の強さ・大きさだけで決める（警報・注意報の発表状況では変えない）
 const autoR=autoR0;
 const rv=s=>{const v=$("#lvRng").value;return v=="auto"?autoR(s):+v};
